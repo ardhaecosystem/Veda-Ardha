@@ -1,0 +1,79 @@
+# Environment Variables (CRITICAL - Contains API Keys)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+ENV/
+env/
+
+# UV Package Manager
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Runtime Data (Personal & Work Memory)
+data/personal_memory/
+data/work_memory/
+data/embeddings/
+data/cache/
+
+# Docker Volumes (Data persists in Docker, not Git)
+docker-compose.override.yml
+
+# Backup Files
+*.backup
+*.bak
+*.old
+*.backup_*
+
+# Sensitive Files
+*.pem
+*.key
+*.cert
+*.crt
+
+# Test Files
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary Files
+*.tmp
+*.temp

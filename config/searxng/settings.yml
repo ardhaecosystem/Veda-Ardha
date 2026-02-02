@@ -1,0 +1,50 @@
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "Veda Search"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+
+server:
+  secret_key: "veda-searxng-secret-change-me"
+  limiter: false
+  image_proxy: true
+
+ui:
+  static_use_hash: true
+  default_theme: simple
+  theme_args:
+    simple_style: dark
+
+engines:
+  - name: duckduckgo
+    weight: 1
+    disabled: false
+    
+  - name: google
+    weight: 1
+    disabled: false
+    
+  - name: stackoverflow
+    weight: 2
+    disabled: false
+    categories: it
+    
+  - name: reddit
+    weight: 1
+    disabled: false
+    
+  - name: github
+    weight: 1.5
+    disabled: false
+    categories: it
+
+  - name: bing
+    disabled: true
+  - name: wikipedia
+    disabled: false
+    weight: 0.5
