@@ -1,12 +1,12 @@
 """
 FastAPI server providing OpenAI-compatible API for Open-WebUI.
-This is the critical bridge between Open-WebUI and Veda's LangGraph core.
+VISION UPGRADE: Now supports Multimodal inputs (Images + Text).
 """
 
 import asyncio
 import json
 import time
-from typing import Optional, List
+from typing import Optional, List, Union, Dict, Any
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -42,29 +42,29 @@ veda: Optional[VedaOrchestrator] = None
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
     global veda
-    
+
     # Startup: Initialize Veda
     logger.info("veda_initialization_started")
     load_dotenv()
-    
+
     client = OpenRouterClient(
         api_key=os.getenv("OPENROUTER_API_KEY"),
         daily_budget=float(os.getenv("DAILY_BUDGET_LIMIT", "2.00"))
     )
-    
+
     memory = MemoryManager(
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
         falkordb_password=os.getenv("FALKORDB_PASSWORD"),
     )
-    
+
     await memory.initialize()
-    
+
     veda = VedaOrchestrator(client, memory)
-    
+
     logger.info("veda_initialized_successfully")
-    
+
     yield
-    
+
     # Shutdown
     logger.info("veda_shutdown_started")
     await memory.close()
@@ -75,7 +75,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Veda AI API",
     description="OpenAI-compatible API for Veda Memorial AI System",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -89,10 +89,11 @@ app.add_middleware(
 )
 
 
-# OpenAI-compatible Request Models
+# --- UPDATED REQUEST MODELS FOR VISION ---
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    # CHANGED: Content can now be a string OR a list (for images)
+    content: Union[str, List[Dict[str, Any]]]
 
 
 class ChatCompletionRequest(BaseModel):
@@ -109,7 +110,7 @@ async def root():
     return {
         "status": "healthy",
         "service": "Veda AI",
-        "version": "1.0.0"
+        "version": "2.0.0"
     }
 
 
@@ -133,29 +134,48 @@ async def list_models():
 async def chat_completions(request: ChatCompletionRequest):
     """
     OpenAI-compatible chat completions endpoint.
-    This is what Open-WebUI calls to talk to Veda.
+    Now handles Vision inputs by extracting text for logic processing
+    but passing full multimodal context to the Model.
     """
-    
+
     if not veda:
         raise HTTPException(status_code=503, detail="Veda is starting up")
-    
+
     # Extract latest user message
-    user_msg = request.messages[-1].content
-    thread_id = "default_thread"  # In production, extract from user ID
+    last_msg = request.messages[-1]
     
-    logger.info("incoming_request", message_preview=user_msg[:50], stream=request.stream)
+    # Logic to extract JUST the text part for Memory/Search systems
+    user_text = ""
+    has_image = False
+    
+    if isinstance(last_msg.content, str):
+        user_text = last_msg.content
+    elif isinstance(last_msg.content, list):
+        # Vision Request: Extract text from list format
+        has_image = True
+        for part in last_msg.content:
+            if part.get("type") == "text":
+                user_text += part.get("text", "") + " "
+    
+    user_text = user_text.strip()
+    thread_id = "default_thread"  # In production, extract from user ID
+
+    logger.info("incoming_request", message_preview=user_text[:50], has_image=has_image, stream=request.stream)
+
+    # Get the full payload (if it's a list) or None
+    full_payload = last_msg.content if has_image else None
 
     if request.stream:
         return StreamingResponse(
-            stream_generator(user_msg, thread_id),
+            stream_generator(user_text, thread_id, full_payload),
             media_type="text/event-stream"
         )
     else:
         # Non-streaming fallback
         full_response = ""
-        async for token in veda.process_message_streaming(user_msg, thread_id):
+        async for token in veda.process_message_streaming(user_text, thread_id, full_message_payload=full_payload):
             full_response += token
-        
+
         return {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
@@ -177,16 +197,16 @@ async def chat_completions(request: ChatCompletionRequest):
         }
 
 
-async def stream_generator(message: str, thread_id: str):
+async def stream_generator(message: str, thread_id: str, full_payload: Optional[List] = None):
     """
     Generate Server-Sent Events (SSE) for Open-WebUI.
-    This prevents "ghosting" and shows live updates.
+    Passes 'full_payload' to enable Vision support.
     """
-    
+
     chunk_id = f"chatcmpl-{int(time.time())}"
-    
+
     try:
-        async for token in veda.process_message_streaming(message, thread_id):
+        async for token in veda.process_message_streaming(message, thread_id, full_message_payload=full_payload):
             chunk_data = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
@@ -199,7 +219,7 @@ async def stream_generator(message: str, thread_id: str):
                 }]
             }
             yield f"data: {json.dumps(chunk_data)}\n\n"
-            
+
         # Send finish signal
         final_chunk = {
             "id": chunk_id,
@@ -214,7 +234,7 @@ async def stream_generator(message: str, thread_id: str):
         }
         yield f"data: {json.dumps(final_chunk)}\n\n"
         yield "data: [DONE]\n\n"
-        
+
     except Exception as e:
         logger.error("streaming_error", error=str(e))
         error_chunk = {

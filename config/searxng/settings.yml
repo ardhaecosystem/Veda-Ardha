@@ -1,16 +1,23 @@
+# SearXNG Configuration - SAP-optimized with JSON API enabled
+# CRITICAL: Added formats to enable API access
+
 use_default_settings: true
 
 general:
   debug: false
-  instance_name: "Veda Search"
+  instance_name: "Veda SAP Search"
 
 search:
   safe_search: 0
   autocomplete: ""
   default_lang: "en"
+  # CRITICAL: Enable JSON format for API access
+  formats:
+    - html
+    - json
 
 server:
-  secret_key: "veda-searxng-secret-change-me"
+  secret_key: "01898dc041a7cbf902d0342a25036784aba51d965f795cea2c4dbec4a636346f"  
   limiter: false
   image_proxy: true
 
@@ -20,31 +27,34 @@ ui:
   theme_args:
     simple_style: dark
 
+# ENGINE CONFIGURATION - SAP-optimized weights
 engines:
+  # Primary search engines
+  - name: google
+    weight: 1.5
+    disabled: false
+
   - name: duckduckgo
     weight: 1
     disabled: false
-    
-  - name: google
-    weight: 1
+
+  - name: bing
+    weight: 1.2
     disabled: false
-    
+
+  # Technical Q&A (highest priority for SAP)
   - name: stackoverflow
-    weight: 2
-    disabled: false
-    categories: it
-    
-  - name: reddit
-    weight: 1
-    disabled: false
-    
-  - name: github
-    weight: 1.5
+    weight: 2.5
     disabled: false
     categories: it
 
-  - name: bing
-    disabled: true
-  - name: wikipedia
+  # Code repositories  
+  - name: github
+    weight: 1.8
     disabled: false
+    categories: it
+
+  # Documentation
+  - name: wikipedia
     weight: 0.5
+    disabled: false
