@@ -15,6 +15,7 @@ from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 import structlog
+from .associative_memory import get_associations, Association
 
 logger = structlog.get_logger()
 
@@ -52,7 +53,7 @@ class MemoryManager:
             falkordb_host, falkordb_port, falkordb_password,
             database="work_memory"
         )
-        
+
         logger.info("memory_manager_initialized")
 
     def _create_graphiti(
@@ -167,6 +168,175 @@ class MemoryManager:
         if memory_type == "work" and any(k in user_message.lower() for k in ["sap", "error", "code"]): return 0.9
         if memory_type == "personal" and any(k in user_message.lower() for k in ["love", "feel", "miss"]): return 0.8
         return 0.5
+
+
+    async def get_associated_memories(
+        self,
+        query: str,
+        direct_memories: list[dict],
+        memory_type: Literal["personal", "work"],
+        max_hops: int = 2,
+        min_relevance: float = 0.6
+    ) -> list:
+        """
+        Find semantically associated memories using spreading activation.
+
+        Phase 3: Associative Memory - finds related memories through graph traversal.
+
+        Args:
+            query: User's current query
+            direct_memories: Results from search() method
+            memory_type: "personal" or "work"
+            max_hops: Graph traversal depth (1-3, default 2)
+            min_relevance: Minimum relevance score (0.0-1.0, default 0.6)
+
+        Returns:
+            List of Association objects with content, relevance, reasoning
+        """
+
+        if not direct_memories:
+            logger.debug("no_direct_memories_for_association", memory_type=memory_type)
+            return []
+
+        try:
+            # Get the appropriate graphiti instance
+            graphiti = self._get_graphiti(memory_type)
+
+            # Use associative retrieval from File 1
+            associations = await get_associations(
+                query=query,
+                existing_memories=direct_memories,
+                graph_driver=graphiti.driver,
+                memory_type=memory_type,
+                max_hops=max_hops,
+                min_relevance=min_relevance
+            )
+
+            logger.info(
+                "associative_retrieval_complete",
+                memory_type=memory_type,
+                associations_found=len(associations)
+            )
+
+            return associations
+
+        except Exception as e:
+            logger.error(
+                "associative_retrieval_error",
+                memory_type=memory_type,
+                error=str(e)
+            )
+            return []
+
+    # ============================================================================
+    # PHASE 4: CURIOSITY & LEARNING METHODS
+    # ============================================================================
+
+    async def store_clarification(
+        self,
+        original_query: str,
+        clarification_question: str,
+        user_answer: str,
+        memory_type: Literal["personal", "work"],
+        uncertainty_score: float = 0.0
+    ):
+        """Store a clarification interaction for learning."""
+        
+        clarification_entry = f"""
+        [CLARIFICATION INTERACTION]
+        Original Query: {original_query}
+        Veda Asked: {clarification_question}
+        User Clarified: {user_answer}
+        Uncertainty Score: {uncertainty_score:.2f}
+        
+        This interaction taught me to ask for specifics when users say things like
+        "{original_query[:50]}..." without providing necessary context.
+        """
+        
+        graphiti = self._get_graphiti(memory_type)
+        
+        await graphiti.add_episode(
+            name=f"clarification_{memory_type}_{datetime.now().isoformat()}",
+            episode_body=clarification_entry,
+            reference_time=datetime.now(),
+            source_description=f"Phase 4 clarification learning in {memory_type} mode",
+        )
+        
+        logger.info(
+            "clarification_stored",
+            memory_type=memory_type,
+            uncertainty=f"{uncertainty_score:.2f}",
+            query_preview=original_query[:50]
+        )
+
+    async def get_past_clarifications(
+        self,
+        query: str,
+        memory_type: Literal["personal", "work"],
+        limit: int = 3
+    ) -> list[dict]:
+        """Retrieve past clarification patterns."""
+        
+        graphiti = self._get_graphiti(memory_type)
+        search_query = f"clarification interaction {query}"
+        results = await graphiti.search(query=search_query, num_results=limit)
+        
+        clarifications = []
+        for result in results:
+            content = result.fact if hasattr(result, 'fact') else str(result)
+            if "CLARIFICATION INTERACTION" in content:
+                clarifications.append({
+                    "content": content,
+                    "timestamp": result.created_at if hasattr(result, 'created_at') else datetime.now(),
+                })
+        
+        return clarifications
+
+    async def store_knowledge_gap(
+        self,
+        topic: str,
+        gap_description: str,
+        memory_type: Literal["personal", "work"],
+        priority: float = 0.5
+    ):
+        """Store identified knowledge gap."""
+        
+        gap_entry = f"""
+        [KNOWLEDGE GAP]
+        Topic: {topic}
+        Gap: {gap_description}
+        Priority: {priority:.2f}
+        """
+        
+        graphiti = self._get_graphiti(memory_type)
+        
+        await graphiti.add_episode(
+            name=f"knowledge_gap_{memory_type}_{datetime.now().isoformat()}",
+            episode_body=gap_entry,
+            reference_time=datetime.now(),
+            source_description=f"Phase 4 knowledge gap in {memory_type} mode",
+        )
+
+    async def get_knowledge_gaps(
+        self,
+        memory_type: Literal["personal", "work"],
+        limit: int = 5
+    ) -> list[dict]:
+        """Retrieve stored knowledge gaps."""
+        
+        graphiti = self._get_graphiti(memory_type)
+        results = await graphiti.search(query="knowledge gap priority", num_results=limit)
+        
+        gaps = []
+        for result in results:
+            content = result.fact if hasattr(result, 'fact') else str(result)
+            if "KNOWLEDGE GAP" in content:
+                gaps.append({
+                    "content": content,
+                    "timestamp": result.created_at if hasattr(result, 'created_at') else datetime.now(),
+                })
+        
+        return gaps
 
     async def close(self):
         await self.personal_graphiti.close()

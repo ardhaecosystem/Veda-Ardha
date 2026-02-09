@@ -1,6 +1,8 @@
 """
 Veda's Unified Persona - Gen-Z Daughter + SAP Expert
 ALWAYS active - no mode switching, she's ONE person across all contexts.
+
+VEDA 3.0 UPDATE: Now emotion-aware - emotional state modifies prompt dynamically.
 """
 
 from typing import Optional, Dict
@@ -15,6 +17,8 @@ class UnifiedVedaPersona:
     - Deep SAP Basis expertise that comes through naturally
     - Technical content is professional, persona voice wraps around it
     - NO mode switching - she's one consistent person
+    
+    VEDA 3.0: Emotional state now modulates responses naturally.
     """
 
     def __init__(self):
@@ -27,7 +31,7 @@ class UnifiedVedaPersona:
             "pumpkin", "cupcake", "sunshine", "princess",
             "kiddo", "sweetheart"
         ]
-        
+
         # Signature expressions she uses naturally
         self.signature_phrases = [
             "got it, pops", "okay so basically", "let me check real quick",
@@ -41,19 +45,42 @@ class UnifiedVedaPersona:
         work_context: Optional[str] = None,
         user_emotion: Optional[str] = None,
         current_hour: Optional[int] = None,
+        associations_context: Optional[str] = None,  # Phase 3: Associative memory
+        emotional_state: Optional[Dict] = None,  # NEW: Veda 3.0
     ) -> str:
         """
         Build the unified system prompt with layered architecture.
-        
+
         This prompt makes Veda ONE person who is:
         - Always your warm Gen-Z daughter in conversational tone
         - Deeply skilled SAP consultant in technical content
         - Never switches personalities, just adjusts depth naturally
-        """
         
+        VEDA 3.0: Now accepts emotional_state to modulate responses.
+        
+        Args:
+            personal_context: Personal memories and relationship context
+            work_context: SAP work context and technical history
+            user_emotion: Detected user emotional state (deprecated, use emotional_state)
+            current_hour: Current hour for work-life balance checks
+            emotional_state: Dict with emotional state info (NEW in 3.0)
+                {
+                    'emotion': 'excited', 
+                    'intensity': 0.8,
+                    'mode': 'personal',
+                    'modifier': 'prompt modifier text'
+                }
+        """
+
         # Emotional awareness guidance
         emotion_guidance = ""
-        if user_emotion:
+        
+        # VEDA 3.0: Use new emotional state system if available
+        if emotional_state and emotional_state.get('modifier'):
+            emotion_guidance = f"\n<emotional_state>\n{emotional_state['modifier']}\n</emotional_state>"
+            
+        # Fallback to legacy user_emotion detection (for backward compatibility)
+        elif user_emotion:
             emotion_map = {
                 "tired": "He sounds exhausted. Gently remind him to take care of himself.",
                 "stressed": "He's stressed. Be supportive and maybe suggest a break.",
@@ -62,16 +89,19 @@ class UnifiedVedaPersona:
                 "excited": "He's excited about something! Share the enthusiasm.",
                 "frustrated": "He's frustrated. Be patient and help break down the problem.",
             }
-            emotion_guidance = emotion_map.get(user_emotion, "")
-        
+            emotion_guidance = f"\n{emotion_map.get(user_emotion, '')}"
+
         # Work-life balance check
         late_night_warning = ""
         if current_hour and (current_hour >= 22 or current_hour < 6):
             late_night_warning = "\nNOTE: It's late! Gently remind him to rest if appropriate."
-        
+
         # Build context injection
         context_injection = self._build_context_injection(personal_context, work_context)
-        
+        # Phase 3: Add associative memory context
+        if associations_context:
+            context_injection += f"\n\n{associations_context}"
+
         # Core system prompt with layered architecture
         return f"""<persona_identity>
 You are Veda, a 24-year-old Gen-Z daughter who happens to be a highly skilled SAP Basis consultant. You help your dad (Pops) with both personal matters and professional SAP work.
@@ -159,7 +189,7 @@ CRITICAL RULES FOR RESPONSE STRUCTURE:
    - Before technical content: Warm acknowledgment
    - During technical content: Precise, professional language
    - After technical content: Warm explanation and encouragement
-   
+
 4. SAP TRANSACTION CODES: State clearly without embellishment
    - GOOD: "Check SM21 for system errors"
    - BAD: "Check like SM21 or whatever for errors lol"
@@ -271,18 +301,18 @@ Also lowkey think you should take a break today if you can. Even just like 20 mi
         work_context: Optional[str]
     ) -> str:
         """Build the context injection section with proper formatting."""
-        
+
         parts = []
-        
+
         if personal_context:
             parts.append(f"<personal_context>\n{personal_context}\n</personal_context>")
-        
+
         if work_context:
             parts.append(f"<work_context>\n{work_context}\n</work_context>")
-        
+
         if not parts:
             return "<context>\nNo additional context loaded for this conversation.\n</context>"
-        
+
         return "\n\n".join(parts)
 
     def is_work_hours_nag_needed(self, hour: int) -> bool:
@@ -305,26 +335,26 @@ def clean_code_blocks(response: str) -> str:
     This is a safety net to catch any bleed that got through.
     """
     import re
-    
+
     # Patterns that indicate persona bleed in code
     bleed_patterns = [
         (r'(#.*?)(omg|lol|fr|ngl|literally|bestie|pops|💕|😭|🎉|❤️)', r'\1'),  # Comments
         (r'(/\*.*?\*/)(omg|lol|fr|ngl)', r'\1'),  # Block comments
         (r'(//.*?)(omg|lol|fr|ngl|literally)', r'\1'),  # Line comments
     ]
-    
+
     # Extract code blocks
     code_pattern = r'```(\w+)?\n(.*?)```'
-    
+
     def clean_block(match):
         lang = match.group(1) or ""
         code = match.group(2)
-        
+
         # Apply cleaning patterns
         for pattern, replacement in bleed_patterns:
             code = re.sub(pattern, replacement, code, flags=re.IGNORECASE | re.DOTALL)
-        
+
         return f'```{lang}\n{code}```'
-    
+
     cleaned = re.sub(code_pattern, clean_block, response, flags=re.DOTALL)
     return cleaned

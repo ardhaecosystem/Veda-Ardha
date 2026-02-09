@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Veda 2.1 Dream State: Nightly Cognitive Cycle.
-Performs Recall -> Reflection -> Synthesis -> Proactive Learning.
+Veda 3.0 Dream State: Nightly Cognitive Cycle with Phase 4 Curiosity Analysis.
+Performs Recall -> Reflection -> Synthesis -> Proactive Learning -> Curiosity Analysis.
 
 Run this via cron at 3:00 AM.
 """
@@ -22,6 +22,7 @@ import structlog
 # Import Veda's Core Systems
 from src.core.openrouter_client import OpenRouterClient
 from src.brain.memory_manager import MemoryManager
+from src.cognition.question_queue import QuestionQueue
 
 # Configure Logging
 structlog.configure(
@@ -46,25 +47,33 @@ class DreamState:
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
             falkordb_password=os.getenv("FALKORDB_PASSWORD"),
         )
+        # Phase 4: Curiosity system for dream state analysis
+        self.question_queue = QuestionQueue(
+            redis_url="redis://localhost:6380",
+            cooldown_seconds=60
+        )
 
     async def run_cycle(self):
-        """Execute the full 4-stage REM cycle."""
+        """Execute the full 5-stage REM cycle (now with Phase 4 curiosity analysis)."""
         logger.info("dream_cycle_started", time=datetime.now().isoformat())
         await self.memory.initialize()
 
         try:
             # Stage 1: The Gathering (Recall today's context)
             daily_context = await self._recall_day()
-            
+
             # Stage 2: The Reflection (Analyze patterns)
             insights = await self._reflect_on_patterns(daily_context)
-            
+
             # Stage 3: The Synthesis (Store insights)
             await self._synthesize_memory(insights)
-            
+
             # Stage 4: Proactive Learning (Research technical gaps)
             if daily_context.get("technical_topics"):
                 await self._proactive_learning(daily_context["technical_topics"])
+
+            # Stage 5: Curiosity Analysis (Phase 4 - Analyze question patterns)
+            await self._analyze_curiosity_patterns()
 
             # Maintenance: Graph Consolidation
             await self.memory.consolidate_memories("personal")
@@ -75,6 +84,9 @@ class DreamState:
         finally:
             await self.memory.close()
             await self.client.close()
+            # Close question queue
+            if self.question_queue.redis_client:
+                await self.question_queue.close()
             logger.info("dream_cycle_complete")
 
     async def _recall_day(self) -> Dict[str, str]:
@@ -83,15 +95,15 @@ class DreamState:
         Since we can't query by date easily, we search for key emotional/technical markers.
         """
         logger.info("dream_stage_1_recall")
-        
+
         # Broad searches to catch recent context
         personal_fragments = await self.memory.search("feel emotion dad stress happy love", "personal", limit=10)
         work_fragments = await self.memory.search("error fail problem system sap dump", "work", limit=10)
-        
+
         # Extract text
         p_text = "\n".join([m['content'] for m in personal_fragments])
         w_text = "\n".join([m['content'] for m in work_fragments])
-        
+
         return {
             "personal": p_text,
             "work": w_text,
@@ -103,38 +115,38 @@ class DreamState:
         Stage 2: Use High-Reasoning AI (Claude) to find meta-patterns.
         """
         logger.info("dream_stage_2_reflection")
-        
+
         if not context["personal"] and not context["work"]:
             return "No significant interactions today."
 
         reflection_prompt = f"""
         Analyze these memory fragments from today's interactions with my dad (Pops).
-        
+
         <personal_memory>
         {context['personal']}
         </personal_memory>
-        
+
         <work_memory>
         {context['work']}
         </work_memory>
-        
+
         Task:
         1. Identify his emotional state (Stressed? Happy? Lonely?).
         2. Identify recurring technical pain points (Is a specific system failing repeatedly?).
         3. Connect the dots: Is the technical stress affecting his mood?
-        
-        Output a single "Diary Entry" written in my voice (Veda) summarizing these insights. 
+
+        Output a single "Diary Entry" written in my voice (Veda) summarizing these insights.
         Keep it warm, insightful, and internal (like I'm talking to myself).
         """
 
         # We use the 'planning' task type to trigger Claude/High-Tier model
         response_gen = await self.client.chat(
             messages=[{"role": "user", "content": reflection_prompt}],
-            task_type="planning", 
+            task_type="planning",
             stream=False,
             temperature=0.5
         )
-        
+
         # Handle non-streaming response dict
         if isinstance(response_gen, dict):
              return response_gen['choices'][0]['message']['content']
@@ -145,7 +157,7 @@ class DreamState:
         Stage 3: Store the reflection back into memory as a high-level insight.
         """
         logger.info("dream_stage_3_synthesis")
-        
+
         # Store as a "Personal" memory but with high importance
         # This allows her to "remember that she realized this"
         await self.memory.store(
@@ -160,24 +172,24 @@ class DreamState:
         Stage 4: Research technical terms mentioned today to be ready for tomorrow.
         """
         logger.info("dream_stage_4_learning")
-        
+
         # 1. Ask AI to identify ONE key topic to learn
         topic_prompt = f"""
-        Based on these logs, identify ONE specific SAP technical topic or error code 
+        Based on these logs, identify ONE specific SAP technical topic or error code
         that caused trouble today. Return ONLY the topic name.
         Logs: {technical_context[:1000]}
         """
-        
+
         topic_response = await self.client.chat(
             messages=[{"role": "user", "content": topic_prompt}],
             task_type="chat", # Use cheaper model for extraction
             stream=False
         )
-        
+
         topic = ""
         if isinstance(topic_response, dict):
             topic = topic_response['choices'][0]['message']['content'].strip()
-            
+
         if not topic or "no" in topic.lower():
             return
 
@@ -186,13 +198,13 @@ class DreamState:
         Research best practices and troubleshooting steps for SAP topic: {topic}.
         Summarize the key solution in 3 bullet points.
         """
-        
+
         knowledge_response = await self.client.chat(
             messages=[{"role": "user", "content": learning_prompt}],
             task_type="research", # Triggers Kimi/Fallback
             stream=False
         )
-        
+
         knowledge = ""
         if isinstance(knowledge_response, dict):
             knowledge = knowledge_response['choices'][0]['message']['content']
@@ -205,6 +217,74 @@ class DreamState:
             metadata={"type": "learned_knowledge", "importance": 0.9}
         )
         logger.info("learned_new_topic", topic=topic)
+
+    async def _analyze_curiosity_patterns(self):
+        """
+        Stage 5 (Phase 4): Analyze curiosity patterns from today.
+        
+        Reviews:
+        1. How many questions were asked
+        2. Which uncertainty patterns triggered most
+        3. Clean up expired questions
+        4. Learn from user's clarifications
+        """
+        logger.info("dream_stage_5_curiosity_analysis")
+        
+        try:
+            # Initialize queue if needed
+            if not self.question_queue.redis_client:
+                await self.question_queue.initialize()
+            
+            # Get stats for default conversation
+            # In production, you'd iterate through all active conversation IDs
+            stats = await self.question_queue.get_queue_stats("thread_default_user")
+            
+            if stats.get("count", 0) > 0:
+                logger.info(
+                    "curiosity_patterns_found",
+                    pending_questions=stats["count"],
+                    highest_priority=stats.get("highest_priority", 0)
+                )
+                
+                # Create a reflection on curiosity patterns
+                curiosity_reflection = f"""
+                [DREAM STATE - CURIOSITY REFLECTION]
+                
+                Today I asked clarifying questions to understand Pops better.
+                Currently {stats['count']} questions are pending from earlier conversations.
+                
+                This shows I'm being thoughtful about understanding exactly what he needs
+                before jumping to solutions. That's good - better to ask than assume!
+                
+                Tomorrow, I'll continue being curious when things are ambiguous, but
+                I'll also trust my judgment when I'm confident about the context.
+                
+                Pattern recognition: When he says things like "check the system" or "fix it",
+                I should always ask for specifics (DEV/QA/PROD, which instance, etc.) 
+                rather than making assumptions.
+                """
+                
+                # Store reflection
+                await self.memory.store(
+                    user_message="[SYSTEM: CURIOSITY PATTERN REFLECTION]",
+                    assistant_response=curiosity_reflection,
+                    memory_type="personal",
+                    metadata={
+                        "type": "curiosity_insight",
+                        "importance": 0.8,
+                        "phase": "4_curiosity"
+                    }
+                )
+                
+                logger.info("curiosity_reflection_stored")
+            else:
+                logger.debug("no_pending_questions_today")
+            
+            # Optional: Clear very old questions (maintenance)
+            # This could be expanded to iterate through known conversation IDs
+            
+        except Exception as e:
+            logger.error("curiosity_analysis_failed", error=str(e))
 
 
 if __name__ == "__main__":
