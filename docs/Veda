@@ -1,0 +1,1038 @@
+# Veda 4.0: The SAP Landscape Architect — complete architecture specification
+
+**Veda 4.0 transforms a generic AI assistant into a context-aware senior SAP consultant with strict multi-project isolation, living documentation, and enterprise-grade privacy.** The architecture leverages FalkorDB's native multi-graph isolation for zero-leak project separation, a bi-temporal knowledge graph via Graphiti for mutable infrastructure state, a hybrid regex-plus-LLM entity extraction pipeline, and a reversible tokenization proxy that ensures no raw infrastructure secrets ever reach cloud LLMs. Every component fits within the existing 16GB RAM VPS and $60/month OpenRouter budget, with FalkorDB queries consistently under 100ms and total privacy overhead under 100ms per request.
+
+---
+
+## 1. System architecture and data flow overview
+
+The Veda 4.0 architecture adds three new layers on top of the existing LangGraph cognitive orchestrator: a **Project Context Manager** for multi-tenant isolation, a **Privacy Proxy** for data anonymization, and a **Landscape Engine** for SAP-specific knowledge management.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         USER INTERFACE                          │
+│                  FastAPI (Chat + File Upload)                    │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────────┐
+│                    PROJECT CONTEXT MANAGER                       │
+│         mount("client_a") ←→ unmount() ←→ mount("client_b")    │
+│    Enforces project_id on ALL downstream operations             │
+└──────────┬──────────────────────────────────────┬───────────────┘
+           │                                      │
+┌──────────▼──────────────┐    ┌──────────────────▼───────────────┐
+│   PRIVACY PROXY         │    │   LANGGRAPH ORCHESTRATOR         │
+│  (Presidio + Custom)    │    │   ┌──────────┐ ┌──────────────┐ │
+│                         │    │   │ Existing  │ │ NEW: Land-   │ │
+│  Anonymize → Cloud LLM  │    │   │ Cognitive │ │ scape Engine │ │
+│  De-anonymize ← Response│    │   │ Phases    │ │ Nodes        │ │
+│                         │    │   │ (Emotions,│ │ (Extract,    │ │
+│  Token Map (Redis)      │    │   │  Meta,    │ │  Validate,   │ │
+│  Session-scoped TTL     │    │   │  Memory,  │ │  Confirm,    │ │
+│                         │    │   │  Curiosity│ │  Write,      │ │
+│  Local Model (Ollama)   │    │   │  )        │ │  Query)      │ │
+│  for sensitive ops      │    │   └──────────┘ └──────────────┘ │
+└──────────┬──────────────┘    └──────────┬───────────────────────┘
+           │                              │
+     ┌─────▼──────┐              ┌────────▼──────────────────────┐
+     │ OpenRouter  │              │  GRAPHITI + FALKORDB           │
+     │ (Cloud LLM) │              │                                │
+     │ ZDR enabled │              │  project_client_a  (graph)     │
+     │ 4-tier route│              │  project_client_b  (graph)     │
+     └────────────┘              │  project_client_c  (graph)     │
+                                  │  sap_ontology_base (template)  │
+                                  │                                │
+                                  │  Redis: project:{id}:*         │
+                                  │  (namespaced cache/state)      │
+                                  └────────────────────────────────┘
+
+Memory Budget (16GB):
+  OS + System:        1.5 GB
+  FalkorDB/Redis:     8-10 GB  (maxmemory 10gb)
+  Python + LangGraph: 1.5 GB
+  Ollama + Qwen3 4B:  3-4 GB   (optional, for sensitive ops)
+  Safety Buffer:      1 GB
+```
+
+---
+
+## 2. Multi-project state management with strict isolation
+
+FalkorDB **natively supports multiple named graphs** within a single instance — each graph occupies a completely separate sparse adjacency matrix with zero cross-graph visibility. This is the strongest possible isolation mechanism and maps perfectly to Veda's multi-project requirement.
+
+### FalkorDB schema: project-scoped landscape graphs
+
+Each project gets its own named graph via `db.select_graph(f"project_{project_id}")`. A Cypher query against `project_client_a` literally **cannot access** nodes in `project_client_b` — they exist in separate data structures.
+
+```python
+from falkordb import FalkorDB
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class ProjectContext:
+    project_id: str
+    graph_name: str
+    graph: object        # FalkorDB Graph handle (lightweight pointer)
+    metadata: dict
+
+class ProjectContextManager:
+    """Enforces strict project isolation across all Veda operations."""
+
+    def __init__(self, host='localhost', port=6379):
+        self.db = FalkorDB(host=host, port=port)
+        self._active: Optional[ProjectContext] = None
+        self._cache: dict = {}
+
+    def mount(self, project_id: str) -> ProjectContext:
+        graph_name = f"project_{project_id}"
+        if graph_name not in self._cache:
+            self._cache[graph_name] = self.db.select_graph(graph_name)
+        self._active = ProjectContext(
+            project_id=project_id,
+            graph_name=graph_name,
+            graph=self._cache[graph_name],
+            metadata={}
+        )
+        return self._active
+
+    def unmount(self):
+        self._active = None
+
+    @property
+    def current(self) -> ProjectContext:
+        if not self._active:
+            raise RuntimeError("No project context mounted — potential cross-leak")
+        return self._active
+
+    def query(self, cypher: str, params: dict = None):
+        return self.current.graph.query(cypher, params or {})
+
+    def create_project(self, project_id: str, template: str = "sap_ontology_base"):
+        """Clone the SAP ontology template into a new project graph."""
+        template_graph = self.db.select_graph(template)
+        new_graph = template_graph.copy(f"project_{project_id}")
+        return new_graph
+
+    def delete_project(self, project_id: str):
+        self.db.select_graph(f"project_{project_id}").delete()
+
+    def list_projects(self) -> list[str]:
+        return [g.replace("project_", "") for g in self.db.list_graphs()
+                if g.startswith("project_")]
+```
+
+### Five-layer defense-in-depth against cross-contamination
+
+**Layer 1 — Graph-level physical isolation.** Separate FalkorDB named graphs provide hardware-grade isolation. A Cypher query against one graph cannot read another.
+
+**Layer 2 — Application-level context enforcement.** The `ProjectContextManager` raises `RuntimeError` if any operation is attempted without an active project context. Every database call and Redis key access routes through this gate.
+
+**Layer 3 — Redis key namespacing.** All Redis keys follow the pattern `project:{project_id}:{resource_type}:{key}`. Conversation state, cached queries, and embeddings are all namespace-scoped. A single Redis database with key prefixing is optimal for the 16GB VPS constraint (separate instances would waste memory on per-instance overhead).
+
+**Layer 4 — LLM prompt scoping.** The system prompt explicitly bounds the LLM to the active project: *"You are operating within project '{project_id}'. You have NO knowledge of other projects. If asked about other projects, respond: 'I only have access to {project_id} context.'"*
+
+**Layer 5 — Response validation.** Post-process LLM responses against a registry of per-project entity names. Flag any response containing entities from a different project for review.
+
+### LangGraph state scoping
+
+LangGraph's Store namespace hierarchy provides long-term project-scoped memory:
+
+```
+("projects", "client_a", "knowledge")     → Client A accumulated knowledge
+("projects", "client_a", "preferences")   → Client A preferences
+("projects", "client_b", "knowledge")     → Client B (completely isolated)
+("system",  "global",   "sap_templates")  → Shared SAP ontology knowledge
+```
+
+Each invocation carries `project_id` in the configurable dict:
+```python
+config = {
+    "configurable": {
+        "thread_id": "conv_123",
+        "project_id": "client_a"  # Scopes everything downstream
+    }
+}
+```
+
+---
+
+## 3. Privacy architecture: the zero-trust tokenization proxy
+
+This is the **most critical** component. Veda handles extremely sensitive infrastructure data (public IPs, VPN endpoints, hostnames, database credentials) but relies on cloud LLMs via OpenRouter. The solution is a **reversible semantic pseudonymization proxy** that strips all sensitive data before it reaches any external API.
+
+### Threat model
+
+| Threat Vector | Risk | Mitigation |
+|---|---|---|
+| Cloud LLM provider logs/trains on prompts | Sensitive data exposure | Tokenization + OpenRouter ZDR (`zdr: true`) |
+| API transit interception | Data in flight | TLS (standard), but tokenization removes value even if intercepted |
+| Model memorization of secrets | Future leakage | Never send raw secrets; category-preserving tokens carry no real values |
+| Pattern inference from token structure | Topology inference | Role-based tokens, minimal context, session-isolated maps |
+| Token map compromise on VPS | Full de-anonymization | Encrypt at rest, session TTL, least-privilege Redis access |
+| API key compromise | Unauthorized inference | Rate limiting, key rotation, IP allowlisting |
+
+### Data classification tiers
+
+- **Tier 1 (Red — NEVER leaves local):** Database passwords, API keys, VPN secrets, SSH keys, connection strings with credentials. Completely redacted before any external call.
+- **Tier 2 (Orange — Tokenized before transit):** IP addresses, hostnames, SAP SIDs, port+host combinations, subnet ranges, database names. Replaced with semantic placeholders.
+- **Tier 3 (Green — Safe for cloud):** Generic SAP architecture concepts, protocol names, error code categories, troubleshooting logic, SAP transaction codes, best-practice recommendations.
+
+### Tokenization implementation
+
+The core approach uses **category-preserving semantic placeholders** that allow LLMs to reason about relationships without knowing actual values:
+
+| Real Data | Token | Reasoning Preserved |
+|---|---|---|
+| `192.168.1.50` | `[IP_APP_SERVER_1]` | Role (app server) |
+| `10.0.0.100` | `[IP_DB_PRIMARY]` | Role (database) |
+| `sap-prod-db-01` | `[HOST_DB_PRIMARY]` | Function |
+| `PRD` | `[SID_PROD]` | Environment tier |
+| `QAS` | `[SID_QA]` | Environment tier |
+| `30015` | `[PORT_HANA_SQL]` | Port function |
+| `sapuser/pass123` | **[REDACTED]** | Never sent |
+
+The token map is stored in Redis with per-session TTL (**1 hour default**), ensuring tokens don't accumulate across sessions:
+
+```python
+class VedaTokenMap:
+    """Bidirectional token map with Redis-backed session scoping."""
+
+    def __init__(self, redis_client, session_id: str, ttl: int = 3600):
+        self.r = redis_client
+        self.fwd_key = f"veda:tokens:{session_id}:fwd"   # real → token
+        self.rev_key = f"veda:tokens:{session_id}:rev"   # token → real
+        self.counter_key = f"veda:tokens:{session_id}:ctr"
+        self.ttl = ttl
+
+    def tokenize(self, real_value: str, entity_type: str,
+                 semantic_hint: str = "") -> str:
+        existing = self.r.hget(self.fwd_key, real_value)
+        if existing:
+            return existing.decode()
+        count = self.r.hincrby(self.counter_key, entity_type, 1)
+        token = f"[{entity_type}_{semantic_hint}_{count}]" if semantic_hint \
+                else f"[{entity_type}_{count}]"
+        self.r.hset(self.fwd_key, real_value, token)
+        self.r.hset(self.rev_key, token, real_value)
+        self.r.expire(self.fwd_key, self.ttl)
+        self.r.expire(self.rev_key, self.ttl)
+        return token
+
+    def detokenize(self, text: str) -> str:
+        all_tokens = self.r.hgetall(self.rev_key)
+        for token, real in all_tokens.items():
+            text = text.replace(token.decode(), real.decode())
+        return text
+```
+
+### Microsoft Presidio integration for PII detection
+
+**Microsoft Presidio** provides the detection foundation, extended with custom SAP-specific recognizers:
+
+```python
+from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
+
+# Custom SAP SID recognizer
+sap_sid_recognizer = PatternRecognizer(
+    supported_entity="SAP_SID",
+    patterns=[Pattern("sid", r'\b[A-Z][A-Z0-9]{2}\b', score=0.6)],
+    context=["SID", "system", "SAP", "landscape", "client"]
+)
+
+# Credential blocker (Tier 1 — always redact)
+credential_recognizer = PatternRecognizer(
+    supported_entity="CREDENTIAL",
+    patterns=[
+        Pattern("password", r'(?i)(?:password|passwd|pwd)\s*[:=]\s*\S+', score=0.95),
+        Pattern("connstr", r'(?i)(?:jdbc|odbc|hana)://[^\s]+', score=0.95),
+    ]
+)
+
+analyzer = AnalyzerEngine()
+analyzer.registry.add_recognizer(sap_sid_recognizer)
+analyzer.registry.add_recognizer(credential_recognizer)
+# Presidio natively handles: IP_ADDRESS, EMAIL_ADDRESS, PHONE_NUMBER
+```
+
+### Complete anonymize → send → de-anonymize pipeline
+
+```
+User: "Why can't PRD connect to sap-prod-db-01 on 192.168.1.50:30015?"
+                    │
+          ┌─────────▼──────────┐
+          │  PRESIDIO ANALYSIS  │  Detect: IP, HOSTNAME, SID, PORT
+          │  + SAP Recognizers  │  Classify sensitivity tier
+          │  ~10-50ms           │  Tier 1: BLOCK | Tier 2: TOKENIZE
+          └─────────┬──────────┘
+                    │
+          ┌─────────▼──────────┐
+          │  TOKEN MAP (Redis)  │  Build/update bidirectional map
+          │  <1ms per lookup    │  Consistent within session
+          └─────────┬──────────┘
+                    │
+          ┌─────────▼──────────┐
+          │  SANITIZED PROMPT   │  → OpenRouter (ZDR: true)
+          │  "Why can't         │
+          │  [SID_PROD] connect │  LLM reasons with tokens.
+          │  to [HOST_DB_1] on  │  System prompt: "Bracketed IDs
+          │  [IP_DB_1]:         │  are symbolic. Do not guess
+          │  [PORT_HANA]?"      │  actual values."
+          └─────────┬──────────┘
+                    │
+          ┌─────────▼──────────┐
+          │  LLM RESPONSE       │  Still contains tokens
+          └─────────┬──────────┘
+                    │
+          ┌─────────▼──────────┐
+          │  DE-ANONYMIZE       │  Replace tokens with real values
+          │  + OUTPUT SCAN      │  Validate no leaked patterns
+          │  ~5-25ms            │
+          └─────────┬──────────┘
+                    │
+User: "The connection from PRD to sap-prod-db-01 on 30015 may fail..."
+```
+
+**Total privacy overhead: ~30-100ms** — negligible compared to LLM inference latency of 500-5000ms.
+
+### Local model for sensitive operations
+
+For queries that touch Tier 1 data (credentials, topology mapping), route to a **local model via Ollama** rather than the cloud:
+
+- **Recommended model:** Qwen3 4B (Q4_K_M quantized) — **~3GB RAM**, good reasoning, runs on CPU at ~5-10 tokens/second
+- **Use for:** Credential lookup, connection string assembly, full topology rendering
+- **Don't use for:** Complex multi-step troubleshooting, architecture reasoning (use cloud LLM with tokenization instead)
+
+```python
+def route_by_sensitivity(query: str, sensitivity: str) -> str:
+    if sensitivity == "HIGH":
+        return "ollama/qwen3:4b"        # Local, no data leaves VPS
+    elif sensitivity == "MEDIUM":
+        return "openrouter/deepseek/deepseek-chat"  # Cheap, tokenized
+    else:
+        return "openrouter/anthropic/claude-sonnet-4"  # Best reasoning
+```
+
+### OpenRouter privacy enforcement
+
+```python
+response = client.chat.completions.create(
+    model="anthropic/claude-sonnet-4",
+    messages=[...],
+    extra_body={
+        "provider": {"data_collection": "deny"},
+        "zdr": True   # Zero Data Retention
+    }
+)
+```
+
+---
+
+## 4. Deep SAP ontology: the expert knowledge model
+
+The knowledge graph schema models the complete SAP landscape topology — systems, instances, hosts, databases, dependencies, and network connections.
+
+### Node types and properties
+
+```cypher
+// SAP System — the core entity
+CREATE (s:SAPSystem {
+  sid: 'PRD',                    // 3-char unique ID
+  system_type: 'S/4HANA',       // S/4HANA, ECC, BW/4HANA, PI/PO, SolMan, CRM
+  description: 'Production ERP',
+  landscape_tier: 'PRD',        // DEV, QAS, PRD, SBX (sandbox)
+  usage_type: 'ABAP',           // ABAP, Java, Dual-Stack
+  kernel_version: '7.89',
+  kernel_patch: '1200',
+  basis_release: '758',
+  client_numbers: ['000','100','200','800'],
+  status: 'ACTIVE',
+  created_at: datetime(), updated_at: datetime()
+})
+
+// SAP Instance — runs within a system
+CREATE (i:SAPInstance {
+  instance_type: 'PAS',          // ASCS, SCS, ERS, PAS, AAS, DVEBMGS, HDB
+  instance_number: '00',         // 2-digit: 00-99
+  features: 'ABAP|GATEWAY|ICMAN|IGS',
+  start_priority: 3,
+  status: 'GREEN',               // GREEN, YELLOW, GRAY, RED
+  virtual_hostname: null,         // For clustered instances
+  process_count: 20               // disp+work processes
+})
+
+// Host — physical or virtual server
+CREATE (h:Host {
+  hostname: 'sapserver01',
+  fqdn: 'sapserver01.internal.company.com',
+  os_type: 'SLES',               // SLES, RHEL, Windows, AIX
+  os_version: '15 SP5',
+  ip_addresses: ['10.0.1.50'],
+  cpu_cores: 8,
+  ram_gb: 64,
+  environment: 'on-premise',      // on-premise, AWS, Azure, GCP
+  cloud_instance_type: null,
+  datacenter: 'DC-01'
+})
+
+// Database
+CREATE (d:Database {
+  db_type: 'HANA',               // HANA, Oracle, DB2, MaxDB, MSSQL, Sybase
+  db_version: '2.0 SPS07 Rev73',
+  db_sid: 'HDB',
+  tenant_name: 'PRD',
+  memory_allocated_gb: 128,
+  backup_strategy: 'daily_full_hourly_log'
+})
+
+// Client (Mandant)
+CREATE (c:Client {
+  client_number: '100',
+  description: 'Production Client',
+  role: 'Production',            // Customizing, Development, Testing, Production
+  is_open: false
+})
+
+// Transport Route
+CREATE (t:TransportRoute {
+  route_type: 'Consolidation',   // Consolidation, Delivery
+  description: 'DEV to QAS consolidation'
+})
+
+// Network Segment
+CREATE (n:NetworkSegment {
+  subnet: '10.0.1.0/24',
+  vlan: 'VLAN100',
+  zone: 'APP',                   // DMZ, APP, DB, MGMT
+  description: 'Application tier network'
+})
+
+// RFC Destination
+CREATE (r:RFCDestination {
+  rfc_name: 'PRD_TO_BW_RFC',
+  connection_type: '3',          // 3=ABAP, H=HTTP, T=TCP/IP, G=External, W=WebRFC
+  target_client: '100',
+  is_trusted: true
+})
+```
+
+### Relationship types
+
+```cypher
+// System → Instance
+(system:SAPSystem)-[:HAS_INSTANCE]->(inst:SAPInstance)
+
+// Instance → Host
+(inst:SAPInstance)-[:RUNS_ON {valid_from: datetime(), valid_to: null}]->(host:Host)
+
+// System → Database
+(system:SAPSystem)-[:USES_DATABASE {connection_type: 'JDBC'}]->(db:Database)
+
+// Database → Host
+(db:Database)-[:HOSTED_ON]->(host:Host)
+
+// System → Client
+(system:SAPSystem)-[:HAS_CLIENT]->(client:Client)
+
+// Transport routes
+(dev:SAPSystem)-[:TRANSPORTS_TO {route_type: 'Consolidation'}]->(qas:SAPSystem)
+(qas:SAPSystem)-[:TRANSPORTS_TO {route_type: 'Delivery'}]->(prd:SAPSystem)
+
+// RFC connections
+(src:SAPSystem)-[:CONNECTS_VIA {rfc_name: 'PRD_TO_BW'}]->(rfc:RFCDestination)
+(rfc:RFCDestination)-[:TARGETS]->(tgt:SAPSystem)
+
+// Dependencies (critical for troubleshooting)
+(pas:SAPInstance)-[:DEPENDS_ON {type: 'enqueue'}]->(ascs:SAPInstance)
+(aas:SAPInstance)-[:DEPENDS_ON {type: 'message_server'}]->(ascs:SAPInstance)
+(ascs:SAPInstance)-[:DEPENDS_ON {type: 'database'}]->(db:Database)
+(ers:SAPInstance)-[:FAILOVER_FOR]->(ascs:SAPInstance)
+
+// Network
+(host:Host)-[:BELONGS_TO_NETWORK]->(net:NetworkSegment)
+```
+
+### SAP port numbering rules (encoded as computable properties)
+
+These rules allow Veda to derive ports from instance numbers without storing every port explicitly:
+
+| Service | Formula | Example (NN=00) | Example (NN=01) |
+|---|---|---|---|
+| SAPGUI Dispatcher | `3200 + NN` | 3200 | 3201 |
+| Gateway | `3300 + NN` | 3300 | 3301 |
+| Message Server | `3600 + NN` | 3600 | 3601 |
+| HTTP (ICM) | `8000 + NN` | 8000 | 8001 |
+| HTTPS (ICM) | `44300 + NN` | 44300 | 44301 |
+| SAPControl HTTP | `5{NN}13` | 50013 | 50113 |
+| SAPControl HTTPS | `5{NN}14` | 50014 | 50114 |
+| HANA SQL (Tenant) | `3{NN}15` | 30015 | 30115 |
+| HANA indexserver | `3{NN}13` | 30013 | 30113 |
+
+These are encoded as a Python function, not stored redundantly in the graph:
+
+```python
+def sap_port(service: str, instance_number: int) -> int:
+    formulas = {
+        "dispatcher": lambda nn: 3200 + nn,
+        "gateway": lambda nn: 3300 + nn,
+        "message_server": lambda nn: 3600 + nn,
+        "http": lambda nn: 8000 + nn,
+        "https": lambda nn: 44300 + nn,
+        "sapcontrol_http": lambda nn: 50000 + nn * 100 + 13,
+        "sapcontrol_https": lambda nn: 50000 + nn * 100 + 14,
+        "hana_sql": lambda nn: 30000 + nn * 100 + 15,
+        "hana_indexserver": lambda nn: 30000 + nn * 100 + 13,
+    }
+    return formulas[service](instance_number)
+```
+
+### Dependency rules for troubleshooting
+
+These rules are stored as `DEPENDS_ON` relationships in the graph and also encoded as expert rules for Veda's reasoning:
+
+- **Database must start before any application instance.** If the HANA database is down, all ABAP instances (PAS, AAS, ASCS) will fail.
+- **ASCS must start before PAS and AAS.** The enqueue server (lock management) and message server (load balancing) live in ASCS.
+- **ERS provides failover for ASCS.** If ASCS fails, the enqueue replication server holds lock table state. With ENSA2 (default since NW 7.53), ASCS can restart on the same node; with ENSA1, it must follow the ERS.
+- **PAS is the first/primary application server.** Since NW 7.50, PAS and AAS are architecturally identical; the term PAS simply denotes the first installed app server.
+- **Message Server is critical for load balancing.** Without it, logon groups cannot distribute users across PAS/AAS instances.
+
+### Example Cypher queries
+
+```cypher
+// Show full landscape for a system tier
+MATCH (s:SAPSystem {landscape_tier: 'PRD'})-[:HAS_INSTANCE]->(i)
+OPTIONAL MATCH (i)-[:RUNS_ON]->(h:Host)
+OPTIONAL MATCH (s)-[:USES_DATABASE]->(d:Database)
+RETURN s.sid, i.instance_type, i.instance_number, h.hostname, d.db_type
+
+// What breaks if the HANA database goes down?
+MATCH (affected)-[:DEPENDS_ON*1..3]->(db:Database {db_type: 'HANA'})
+RETURN affected.sid, affected.instance_type, affected.status
+
+// Show transport route
+MATCH path = (dev:SAPSystem)-[:TRANSPORTS_TO*]->(prd:SAPSystem)
+WHERE dev.landscape_tier = 'DEV' AND prd.landscape_tier = 'PRD'
+RETURN [n IN nodes(path) | n.sid] AS route
+
+// All RFC connections from a system
+MATCH (s:SAPSystem {sid: 'PRD'})-[:CONNECTS_VIA]->(rfc)-[:TARGETS]->(t)
+RETURN rfc.rfc_name, t.sid, rfc.connection_type
+```
+
+---
+
+## 5. Entity extraction pipeline: regex-first, LLM-fallback
+
+Given the **$60/month budget**, the pipeline uses a cost-optimized hybrid approach: deterministic regex/parsers handle ~80% of extraction at zero LLM cost, with LLM reserved for ambiguous conversational text.
+
+### Three-tier extraction architecture
+
+```
+Input Text
+     │
+     ▼
+┌──────────────┐
+│ Classifier   │  Rule-based: detect if structured (log/command) or conversational
+└──────┬───────┘
+       │
+  ┌────┴─────────────┐
+  ▼                  ▼
+Structured         Conversational
+  │                  │
+  ▼                  ▼
+┌──────────┐    ┌────────────────┐
+│ Tier 1:  │    │ Tier 3:        │
+│ Regex +  │    │ LLM Extract    │
+│ Parser   │    │ (PydanticAI)   │
+│ (FREE)   │    │ (DeepSeek V3)  │
+└────┬─────┘    └───────┬────────┘
+     │                  │
+     └──────┬───────────┘
+            ▼
+     ┌──────────────┐
+     │ Confidence   │  Combine regex (0.95) + LLM logprobs
+     │ Scorer       │
+     └──────┬───────┘
+            ▼
+     ┌──────────────┐
+     │ Entity       │  Resolve against existing graph
+     │ Resolution   │  SID match → UPDATE; new entity → CREATE
+     └──────┬───────┘
+            ▼
+     ┌──────────────┐
+     │ Confirm or   │  ≥0.90: auto-accept
+     │ Auto-accept  │  0.70-0.90: suggest with pre-fill
+     └──────────────┘  <0.70: flag for manual review
+```
+
+### Key regex patterns for SAP data
+
+```python
+import re
+
+SAP_PATTERNS = {
+    "sid": re.compile(
+        r'(?:SID[=:\s]+|/usr/sap/|system[=:\s]+)([A-Z][A-Z0-9]{2})\b'
+    ),
+    "instance_nr": re.compile(
+        r'(?:-nr\s+|instance\s*(?:number|nr)?[:\s]+|'
+        r'ASCS|SCS|ERS|DVEBMGS|D|J|JC|HDB)(\d{2})\b'
+    ),
+    "ip_v4": re.compile(
+        r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}'
+        r'(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'
+    ),
+    "instance_dir": re.compile(
+        r'/usr/sap/([A-Z][A-Z0-9]{2})/'
+        r'(ASCS|SCS|ERS|DVEBMGS|D|J|JC|HDB)(\d{2})'
+    ),
+    "profile_name": re.compile(
+        r'([A-Z][A-Z0-9]{2})_(ASCS|SCS|DVEBMGS|D|J|ERS)(\d{2})_(\S+)'
+    ),
+    "transport_request": re.compile(r'\b([A-Z][A-Z0-9]{2}K\d{6})\b'),
+    "sap_port": re.compile(r'\b(3[2-9]\d{2}|4[0-4]\d{2}|5\d{3}|8\d{3})\b'),
+}
+
+# Dedicated sapcontrol output parser
+def parse_sapcontrol_table(output: str) -> list[dict]:
+    lines = [l.strip() for l in output.strip().split('\n') if l.strip()]
+    header_idx = next(
+        i for i, l in enumerate(lines)
+        if ',' in l and 'OK' not in l
+    )
+    headers = [h.strip() for h in lines[header_idx].split(',')]
+    return [
+        dict(zip(headers, [v.strip() for v in line.split(',')]))
+        for line in lines[header_idx + 1:]
+        if ',' in line
+    ]
+```
+
+### Pydantic models for extracted entities
+
+```python
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, Literal
+
+class SAPSystemID(BaseModel):
+    entity_type: Literal["sap_sid"] = "sap_sid"
+    value: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    source: Literal["regex", "parser", "llm", "user_confirmed"]
+
+    @field_validator('value')
+    @classmethod
+    def validate_sid(cls, v):
+        v = v.upper()
+        RESERVED = {"ADD","ALL","AND","ANY","ASC","COM","CON","DBA",
+                     "END","FOR","INT","KEY","LOG","SAP","USR","VAR"}
+        if len(v) != 3 or not v[0].isalpha() or not v.isalnum():
+            raise ValueError(f"Invalid SID: {v}")
+        if v in RESERVED:
+            raise ValueError(f"Reserved SID: {v}")
+        return v
+
+class SAPLandscapeSnapshot(BaseModel):
+    """Complete extraction result from a single input."""
+    systems: list[dict] = []
+    instances: list[dict] = []
+    hosts: list[dict] = []
+    ip_addresses: list[dict] = []
+    databases: list[dict] = []
+    needs_confirmation: list[dict] = Field(
+        default_factory=list,
+        description="Entities below 0.90 confidence needing user review"
+    )
+```
+
+### Confidence scoring thresholds
+
+| Source | Base Confidence | Action |
+|---|---|---|
+| Regex in structured context (directory path, sapcontrol) | **0.95-1.0** | Auto-accept |
+| CSV/table parser output | **0.95-1.0** | Auto-accept |
+| Regex in unstructured text | **0.70-0.85** | Suggest with pre-fill |
+| LLM extraction passing Pydantic validation | **0.75-0.90** | Suggest with pre-fill |
+| LLM extraction failing validation | **0.40-0.65** | Flag for review |
+
+Modifiers: **+0.05** if entity appears multiple times; **+0.10** if validated against SAP port convention; **-0.10** if ambiguous context.
+
+---
+
+## 6. Temporal knowledge graph: living documentation that self-corrects
+
+Infrastructure changes constantly — IPs migrate, versions upgrade, systems move to cloud. The bi-temporal model tracks both **when a fact was true** (valid time) and **when the system learned it** (transaction time), using Graphiti's native temporal edge management.
+
+### Bi-temporal schema on edges
+
+```cypher
+// Current state lives on the node (fast reads, no temporal filter needed)
+(s:SAPSystem {sid: 'PRD', current_ip: '10.0.1.55', updated_at: datetime()})
+
+// History lives on temporal edges (audit trail)
+(s)-[:HAS_IP {
+  ip_address: '10.0.1.55',
+  valid_from: datetime('2025-01-15'),
+  valid_to: null,           // null = currently valid
+  created_at: datetime(),   // when Veda learned this
+  expired_at: null,         // null = not invalidated
+  source: 'network_scan',
+  confidence: 0.95
+}]->(ip:IPAddress {address: '10.0.1.55'})
+```
+
+**Design principle:** Current state on nodes for O(1) access; temporal edges for the audit trail. Querying "what is the current IP?" never needs temporal filtering. Only historical/audit queries use `WHERE valid_to IS NOT NULL`.
+
+### Cross-verify before destructive update
+
+Different property types get different conflict resolution strategies:
+
+| Property | Strategy | Rationale |
+|---|---|---|
+| IP address | Last-Write-Wins + audit trail | IPs change during migrations; scan data is authoritative |
+| SAP version | Monotonic increase + flag downgrades | Versions only increase; a "downgrade" suggests data error |
+| Hostname | Cross-verify with multiple sources | Hostname changes are rare and high-impact |
+| System role | Human confirmation required | Role changes (DEV→QAS→PRD) have major implications |
+
+```python
+class CrossVerifyUpdate:
+    THRESHOLDS = {
+        'ip_address': 0.70,     # Auto-apply if confidence ≥ 0.70
+        'hostname': 0.85,       # Require higher confidence
+        'sap_version': 0.90,    # High — versions rarely reported wrong
+        'system_role': 1.0,     # Always require human confirmation
+    }
+
+    async def propose_update(self, entity_id, field, new_value, source):
+        confidence = self.calculate_confidence(source, field)
+        if confidence >= self.THRESHOLDS[field]:
+            await self.apply_update(entity_id, field, new_value)
+        else:
+            await self.flag_for_review(entity_id, field, new_value)
+```
+
+### Graphiti integration for temporal management
+
+Graphiti (v0.17+) natively supports FalkorDB and handles temporal edge management automatically:
+
+```python
+from graphiti_core import Graphiti
+from graphiti_core.driver.falkordb_driver import FalkorDriver
+
+driver = FalkorDriver(host="localhost", port=6379,
+                      database="project_client_a")
+graphiti = Graphiti(graph_driver=driver)
+
+# Ingesting new data — Graphiti automatically:
+# 1. Extracts entities via LLM
+# 2. Resolves against existing nodes (dedup)
+# 3. Detects contradictions with existing edges
+# 4. Invalidates old edges (sets expired_at)
+# 5. Creates new edges with temporal metadata
+await graphiti.add_episode(
+    name="network_scan_2025-01-15",
+    episode_body='PRD system migrated to IP 10.0.1.55 on host sapserver02',
+    source=EpisodeType.text,
+    reference_time=datetime.now(timezone.utc),
+    group_id="landscape_prod"
+)
+```
+
+---
+
+## 7. Data ingestion strategy: hybrid approach
+
+The **hybrid strategy** — file-based for initial bulk load, conversational for ongoing management — optimizes both user experience and accuracy.
+
+### File-based ingestion (initial load of 60+ systems)
+
+```python
+# FastAPI endpoint for landscape file upload
+@app.post("/api/v1/landscape/upload")
+async def upload_landscape(file: UploadFile, project_id: str):
+    if file.filename.endswith(('.xlsx', '.xls')):
+        df = pd.read_excel(await file.read())
+    elif file.filename.endswith('.csv'):
+        df = pd.read_csv(io.StringIO((await file.read()).decode()))
+    elif file.filename.endswith('.json'):
+        data = json.loads(await file.read())
+
+    # Validate each row with Pydantic
+    validated = []
+    errors = []
+    for idx, row in df.iterrows():
+        try:
+            entity = SAPSystemInput(**row.to_dict())
+            validated.append(entity)
+        except ValidationError as e:
+            errors.append({"row": idx, "error": str(e)})
+
+    # Bulk ingest via Graphiti
+    for entity in validated:
+        await graphiti.add_episode(
+            name=f"bulk_import_{entity.sid}",
+            episode_body=entity.model_dump_json(),
+            source=EpisodeType.json,
+            group_id=project_id
+        )
+
+    return {"imported": len(validated), "errors": errors}
+```
+
+### Conversational ingestion (ongoing updates)
+
+User pastes a log or says *"Add server ERP-D02 at 10.2.3.4"* → LLM extracts entities → validates against schema → confirms with user → stores in graph.
+
+### Expected Excel template format
+
+| SID | System Type | Tier | Instance Type | Instance Nr | Hostname | IP Address | DB Type | DB SID |
+|---|---|---|---|---|---|---|---|---|
+| PRD | S/4HANA | PRD | ASCS | 00 | prd-ascs01 | 10.0.1.10 | HANA | HDB |
+| PRD | S/4HANA | PRD | PAS | 01 | prd-app01 | 10.0.1.11 | HANA | HDB |
+| QAS | S/4HANA | QAS | ASCS | 00 | qas-ascs01 | 10.0.2.10 | HANA | HDB |
+
+---
+
+## 8. Code structure and new modules
+
+```
+veda/
+├── app/
+│   ├── main.py                        # FastAPI entry point
+│   ├── config.py                      # Pydantic BaseSettings
+│   │
+│   ├── api/v1/
+│   │   ├── chat.py                    # Conversation endpoints
+│   │   ├── ingestion.py               # File upload + bulk ingestion
+│   │   ├── landscape.py               # Landscape query endpoints
+│   │   └── admin.py                   # Project management
+│   │
+│   ├── core/
+│   │   ├── langgraph/
+│   │   │   ├── orchestrator.py        # Main LangGraph graph
+│   │   │   ├── state.py              # VedaState TypedDict
+│   │   │   ├── edges.py             # Conditional routing logic
+│   │   │   └── nodes/
+│   │   │       ├── classifier.py     # Input type detection
+│   │   │       ├── extractor.py      # Entity extraction (regex+LLM)
+│   │   │       ├── validator.py      # Pydantic validation
+│   │   │       ├── confirmer.py      # Human-in-the-loop
+│   │   │       ├── writer.py         # Graph write operations
+│   │   │       ├── querier.py        # Graph query operations
+│   │   │       └── formatter.py      # Response formatting
+│   │   │
+│   │   ├── privacy/                   # ← NEW: Privacy proxy
+│   │   │   ├── anonymizer.py         # Presidio + custom recognizers
+│   │   │   ├── token_map.py          # Redis-backed token map
+│   │   │   ├── sensitivity.py        # Tier classification
+│   │   │   └── middleware.py         # FastAPI middleware
+│   │   │
+│   │   ├── projects/                  # ← NEW: Multi-project isolation
+│   │   │   ├── context_manager.py    # mount/unmount/query
+│   │   │   ├── isolation.py          # Cross-contamination guards
+│   │   │   └── templates.py          # SAP ontology base template
+│   │   │
+│   │   ├── llm/
+│   │   │   ├── router.py             # 4-tier model routing
+│   │   │   ├── clients.py            # OpenRouter + Ollama clients
+│   │   │   └── prompts/              # System prompts
+│   │   │
+│   │   └── memory/
+│   │       ├── graphiti_service.py    # Graphiti client wrapper
+│   │       ├── entity_types.py        # SAP Pydantic entity types
+│   │       └── edge_types.py          # Relationship definitions
+│   │
+│   ├── ingestion/                     # ← NEW: Data ingestion
+│   │   ├── parsers/
+│   │   │   ├── excel_parser.py
+│   │   │   ├── csv_parser.py
+│   │   │   ├── sapcontrol_parser.py   # sapcontrol output parser
+│   │   │   └── hosts_parser.py        # /etc/hosts parser
+│   │   ├── extractors/
+│   │   │   ├── regex_engine.py        # All SAP regex patterns
+│   │   │   ├── llm_extractor.py       # PydanticAI extraction
+│   │   │   └── confidence.py          # Scoring logic
+│   │   └── templates/
+│   │       └── sap_landscape.xlsx     # Download template
+│   │
+│   ├── sap/                           # ← NEW: SAP domain knowledge
+│   │   ├── ontology.py               # Node/edge type definitions
+│   │   ├── ports.py                  # Port formula calculations
+│   │   ├── dependencies.py           # Startup order rules
+│   │   └── validators.py             # SID, instance number validation
+│   │
+│   └── cognitive/                     # EXISTING: Veda 3.0 phases
+│       ├── emotions.py
+│       ├── metacognition.py
+│       ├── associative_memory.py
+│       └── curiosity.py
+│
+├── tests/
+│   ├── unit/
+│   │   ├── test_regex_patterns.py
+│   │   ├── test_sap_validators.py
+│   │   ├── test_anonymizer.py
+│   │   ├── test_token_map.py
+│   │   └── test_port_calculations.py
+│   ├── integration/
+│   │   ├── test_project_isolation.py  # Cross-contamination tests
+│   │   ├── test_graphiti_ingestion.py
+│   │   ├── test_privacy_pipeline.py
+│   │   └── test_langgraph_flows.py
+│   └── fixtures/
+│       ├── sample_landscape.xlsx
+│       ├── sapcontrol_output.txt
+│       └── sample_hosts_file.txt
+│
+├── docker-compose.yml
+└── pyproject.toml
+```
+
+---
+
+## 9. Implementation phases with estimated effort
+
+### Phase 1: Foundation (Weeks 1-2, ~40 hours)
+
+- Set up new project structure alongside Veda 3.0
+- Implement `ProjectContextManager` with FalkorDB multi-graph
+- Define all SAP Pydantic entity types and edge types
+- Create SAP ontology base template graph
+- Build Redis key namespacing layer
+- **Deliverable:** Multi-project creation, mounting, and isolation working
+
+### Phase 2: Privacy proxy (Weeks 3-4, ~30 hours)
+
+- Install and configure Microsoft Presidio with custom SAP recognizers
+- Build `VedaTokenMap` with Redis-backed session scoping
+- Implement FastAPI middleware for anonymize/de-anonymize pipeline
+- Configure OpenRouter ZDR and data collection denial
+- Add audit logging for all sanitized prompts
+- **Deliverable:** No raw infrastructure data reaches cloud LLMs
+
+### Phase 3: Entity extraction pipeline (Weeks 5-6, ~35 hours)
+
+- Build regex extraction engine with all SAP patterns
+- Build sapcontrol and /etc/hosts parsers
+- Integrate PydanticAI for LLM-based extraction of conversational text
+- Implement confidence scoring and thresholds
+- Build user confirmation flow in LangGraph
+- **Deliverable:** Paste a log file → structured entities extracted and stored
+
+### Phase 4: File ingestion and landscape engine (Weeks 7-8, ~30 hours)
+
+- Build Excel/CSV/JSON upload endpoints
+- Create landscape download template
+- Integrate Graphiti for temporal knowledge management
+- Implement cross-verify-before-update logic
+- Extend LangGraph with landscape query nodes
+- **Deliverable:** Upload Excel → full landscape in graph; ask "What depends on HANA?" → accurate answer
+
+### Phase 5: Integration, testing, and migration (Weeks 9-10, ~25 hours)
+
+- End-to-end integration testing
+- Cross-contamination tests (attempt to leak data between projects)
+- Privacy pipeline red-team testing (attempt to extract secrets)
+- Performance benchmarking (latency, memory)
+- Migrate Veda 3.0 episodic memory to 4.0 graph structure
+- Gradual cutover from 3.0 to 4.0
+- **Deliverable:** Production-ready Veda 4.0
+
+**Total estimated effort: ~160 hours over 10 weeks**
+
+---
+
+## 10. Performance impact analysis
+
+### Response latency budget
+
+| Component | Latency | Notes |
+|---|---|---|
+| FastAPI routing | 1-5ms | Negligible |
+| Project context mount | <1ms | FalkorDB `select_graph` is a lightweight pointer |
+| Presidio analysis | 10-50ms | Regex-heavy, scales with text length |
+| Token map Redis ops | <1ms | HGET/HSET sub-millisecond |
+| FalkorDB graph query | **36ms P50, 83ms P99** | Benchmarked, well under 500ms target |
+| Graphiti hybrid search | ~300ms P95 | No LLM calls during retrieval |
+| OpenRouter LLM inference | 500-3000ms | Dominant latency; model-dependent |
+| De-anonymize + output scan | 5-25ms | String replacement + pattern match |
+| **Total (graph-only query)** | **~50-140ms** | **Well under 500ms target** |
+| **Total (LLM-augmented)** | **~600-3200ms** | LLM is the bottleneck, not Veda |
+
+### Memory consumption
+
+| Component | Allocation | Actual Expected |
+|---|---|---|
+| FalkorDB (60 systems, ~500 nodes, ~5000 edges) | 10GB max | **~100-200MB actual** |
+| Redis (cache, token maps, state) | shared with FalkorDB | ~200-500MB |
+| Graphiti embeddings (1024D × 500 entities) | included in FalkorDB | ~50MB |
+| Presidio + spaCy NLP model | — | ~300-500MB |
+| Ollama + Qwen3 4B (optional) | — | ~3-4GB |
+| Python app + LangGraph | — | ~500MB-1GB |
+| OS (Ubuntu 24.04) | — | ~1.5GB |
+| **Total** | **16GB** | **~7-9GB** (comfortable headroom) |
+
+### Cost projection with 4-tier model routing
+
+| Tier | Use Cases | Model | Cost/M tokens |
+|---|---|---|---|
+| Tier 1 (Micro) | Classification, intent detection, simple formatting | Gemini Flash-Lite / DeepSeek V3 | $0.14-0.53 |
+| Tier 2 (Light) | Entity extraction, validation, deduplication | GPT-4o-mini / DeepSeek V3 | $0.15-1.50 |
+| Tier 3 (Standard) | Complex reasoning, multi-turn conversation | Claude 3.5 Sonnet / DeepSeek R1 | $2-5 |
+| Tier 4 (Premium) | Architecture decisions, ambiguous data resolution | Claude Opus / GPT-4o | $15-30 |
+
+With ~80% of calls on Tier 1-2, ~15% on Tier 3, and ~5% on Tier 4, the blended rate is **~$1.50-2.00/M tokens**. At an estimated **20M tokens/month**, total cost is **~$30-40/month** — well within the $60 budget.
+
+---
+
+## 11. Testing strategy by component
+
+**Privacy pipeline tests** are the highest priority given the security criticality:
+
+- **Unit tests for anonymizer:** Assert that every Tier 1 entity (passwords, connection strings) is completely redacted. Assert every Tier 2 entity (IPs, hostnames, SIDs) is tokenized. Assert Tier 3 data passes through unchanged. Test with adversarial inputs designed to bypass regex patterns.
+- **Round-trip tests:** Verify `detokenize(tokenize(text)) == text` for all entity types.
+- **Leakage tests:** Send 1000 sanitized prompts to a test LLM, grep responses for any real values from the token map. Zero tolerance for leakage.
+
+**Project isolation tests:**
+- Create two projects with overlapping entity names. Query one project, assert zero results from the other.
+- Attempt cross-graph Cypher injection (e.g., include `GRAPH.QUERY other_graph` in user input). Verify rejection.
+
+**Entity extraction tests:**
+- Golden dataset: 50 sample sapcontrol outputs, /etc/hosts files, and conversation transcripts with manually labeled entities. Measure precision/recall.
+- Regression tests for every regex pattern against edge cases.
+
+**Graph integrity tests:**
+- After bulk ingestion, verify: correct node count, edge count, no orphaned nodes, no duplicate entities, all temporal edges have valid timestamps.
+
+**End-to-end tests:**
+- Upload sample Excel → verify all entities in graph → query "What depends on HANA?" → validate response contains correct dependency chain → verify no raw data leaked to LLM.
+
+---
+
+## 12. Migration path from Veda 3.0 to 4.0
+
+The migration follows an **incremental, parallel-run** strategy — both versions run simultaneously during transition.
+
+**Step 1: Deploy new infrastructure.** Add the new modules (privacy, projects, ingestion, sap) alongside the existing cognitive phases. The existing 4 cognitive phases (Emotions, Metacognition, Associative Memory, Curiosity) remain untouched.
+
+**Step 2: Create the SAP ontology base template.** Build the `sap_ontology_base` graph with standard node types, relationship types, and SAP rules. This template gets cloned for each new project.
+
+**Step 3: Export Veda 3.0 episodic memory.** Use Graphiti's search API to extract all existing episodes. Re-ingest them into the new project-scoped graphs with proper entity typing.
+
+**Step 4: Enable privacy proxy.** Route all new LLM calls through the anonymization middleware. Monitor audit logs for any leakage. Disable Ollama integration initially (Phase 2 enhancement).
+
+**Step 5: Parallel run.** Run both Veda 3.0 and 4.0 for 1-2 weeks. Compare responses for consistency. Validate that all existing cognitive phases work correctly with the new privacy proxy.
+
+**Step 6: Cutover.** Switch all traffic to Veda 4.0. Keep Veda 3.0 as rollback for 1 week, then decommission.
+
+**Backward compatibility:** The existing LangGraph orchestrator gains new nodes but the existing cognitive branch topology remains unchanged. The privacy proxy wraps around the existing LLM call layer transparently. Project context mounting is additive — a "default" project acts as the fallback for non-project-scoped conversations.
+
+---
+
+## Conclusion: a practical, budget-conscious path to enterprise-grade SAP intelligence
+
+The Veda 4.0 architecture achieves enterprise-grade security and SAP expertise within severe resource constraints through four key design decisions. **First**, FalkorDB's native multi-graph support provides physical project isolation at zero performance cost — no property-based filtering hacks, no cross-contamination risk. **Second**, the semantic pseudonymization proxy (Presidio + Redis token maps) adds only ~30-100ms overhead while guaranteeing no raw infrastructure secrets reach cloud APIs. **Third**, the regex-first extraction pipeline keeps LLM costs to ~$30-40/month by reserving expensive inference for genuinely ambiguous text. **Fourth**, the bi-temporal model via Graphiti enables living documentation that self-corrects when infrastructure changes, while maintaining a complete audit trail.
+
+The most novel insight from this research is that **category-preserving tokens** (like `[IP_DB_PRIMARY]` instead of opaque hashes) let cloud LLMs reason about infrastructure topology, dependencies, and troubleshooting without ever seeing real values. The LLM understands that `[SID_PROD]` depends on `[HOST_DB_PRIMARY]` and can suggest checking firewall rules, DNS resolution, and port accessibility — all without knowing the actual IP is `192.168.1.50`. This approach turns a fundamental security constraint into an architectural advantage: the tokenized prompts are often *cleaner* and more focused than raw data, potentially improving LLM reasoning quality.
+
+The 10-week, 160-hour implementation plan is designed for a single developer working part-time. Phase 2 (privacy proxy) should be prioritized above all else — it's the foundation that makes everything else safe to build. The architecture leaves room for future enhancements: RBAC per project, automated landscape discovery via SSH/RFC connections, and eventually TEE-backed inference when providers make it available at accessible price points.
