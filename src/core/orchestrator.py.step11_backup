@@ -1,10 +1,12 @@
 """
-Veda 4.0 Orchestrator: Complete Week 3 (Steps 9-12)
+Veda 4.0 Orchestrator: Step 11 - Landscape Analyzer Integration
 
-STEP 9: Project awareness and switching
-STEP 10: SAP query detection and knowledge_service integration
-STEP 11: Landscape analysis (health, risks, recommendations, capacity)
-STEP 12: Full project management (create, rename, delete)
+NEW in Step 11:
+- Health check commands
+- Risk analysis
+- Recommendations
+- Capacity analysis
+- Report generation
 """
 
 import asyncio
@@ -101,10 +103,8 @@ class VedaOrchestrator:
             'list': r'(?:list|show|what)\s+projects?',
             'switch': r'switch\s+(?:to\s+)?(?:project\s+)?([a-z0-9_]+)',
             'current': r'(?:what|which)\s+project(?:\s+am\s+i\s+(?:in|using))?',
-            'create': r'create\s+project\s+([a-z0-9_]+)(?:\s+(.+))?',
+            'create': r'create\s+project\s+([a-z0-9_]+)',
             'info': r'(?:info|details)\s+(?:for|about)\s+(?:project\s+)?([a-z0-9_]+)',
-            'rename': r'rename\s+project\s+([a-z0-9_]+)\s+to\s+(.+)',
-            'delete': r'delete\s+project\s+([a-z0-9_]+)(?:\s+confirm)?',
         }
 
         # =====================================================================
@@ -146,8 +146,7 @@ class VedaOrchestrator:
             project_enabled=self.project_enabled,
             sap_queries_enabled=True,
             landscape_analysis_enabled=True,
-            project_management_enabled=True,
-            features=["emotion", "metacognition", "vision", "sap_agent", "memory", "multi_project", "sap_queries", "landscape_analysis", "project_management"]
+            features=["emotion", "metacognition", "vision", "sap_agent", "memory", "multi_project", "sap_queries", "landscape_analysis"]
         )
 
     def _build_graph(self) -> StateGraph:
@@ -617,84 +616,6 @@ class VedaOrchestrator:
                 logger.error("project_info_error", error=str(e), project_id=project_id)
                 return f"Couldn't get info for project `{project_id}`: {str(e)}"
 
-        # =====================================================================
-        # STEP 12: PROJECT MANAGEMENT COMMANDS
-        # =====================================================================
-
-        # Command: Create project
-        match = re.search(self.project_commands['create'], message_lower)
-        if match:
-            project_id = match.group(1)
-            description = match.group(2) if len(match.groups()) > 1 and match.group(2) else None
-            
-            try:
-                # Create project
-                context = self.memory.project_manager.create_project(
-                    project_id=project_id,
-                    metadata={'description': description} if description else None
-                )
-                
-                # Switch to new project
-                await self._switch_project(project_id, user_id)
-                
-                response = f"✅ Created project **{project_id}**!\n\n"
-                if description:
-                    response += f"Description: {description}\n\n"
-                response += "You're now working in this project. Add systems with SAP tools! 💙"
-                
-                logger.info("project_created", project_id=project_id, user_id=user_id)
-                return response
-            except ValueError as e:
-                return f"❌ Couldn't create project: {str(e)}"
-            except Exception as e:
-                logger.error("create_project_error", error=str(e), project_id=project_id)
-                return f"❌ Error creating project: {str(e)}"
-
-        # Command: Rename project
-        match = re.search(self.project_commands['rename'], message_lower)
-        if match:
-            project_id = match.group(1)
-            new_name = match.group(2)
-            
-            try:
-                # Update metadata
-                self.project_service.update_metadata(
-                    project_id=project_id,
-                    name=new_name
-                )
-                
-                logger.info("project_renamed", project_id=project_id, new_name=new_name, user_id=user_id)
-                return f"✅ Renamed project `{project_id}` to **{new_name}**!"
-            except Exception as e:
-                logger.error("rename_project_error", error=str(e), project_id=project_id)
-                return f"❌ Error renaming project: {str(e)}"
-
-        # Command: Delete project
-        match = re.search(self.project_commands['delete'], message_lower)
-        if match:
-            project_id = match.group(1)
-            has_confirm = 'confirm' in message_lower
-            
-            if not has_confirm:
-                return f"⚠️ **Warning:** Deleting `{project_id}` will permanently remove all data!\n\nTo confirm, say: **delete project {project_id} confirm**"
-            
-            try:
-                # Unmount if current
-                if self.current_project_id == project_id:
-                    self.current_project_id = None
-                    self.knowledge_service = None
-                    self.landscape_analyzer = None
-                    logger.debug("unmounted_project_before_delete", project_id=project_id)
-                
-                # Delete
-                self.memory.project_manager.delete_project(project_id, confirm=True)
-                
-                logger.warning("project_deleted", project_id=project_id, user_id=user_id)
-                return f"✅ Deleted project `{project_id}`. All data has been removed."
-            except Exception as e:
-                logger.error("delete_project_error", error=str(e), project_id=project_id)
-                return f"❌ Error deleting project: {str(e)}"
-
         return None
 
     async def _switch_project(self, project_id: str, user_id: str) -> str:
@@ -761,13 +682,7 @@ class VedaOrchestrator:
         user_id: str = "unknown"
     ):
         """
-        Veda 4.0 Week 3 Complete: Full multi-project SAP landscape management.
-        
-        Steps 9-12:
-        - Project awareness and switching
-        - SAP queries via knowledge_service
-        - Landscape analysis via landscape_analyzer
-        - Full project management (create/rename/delete)
+        Veda 4.0 Step 11: With landscape analysis capabilities.
         """
 
         logger.info(
@@ -775,7 +690,7 @@ class VedaOrchestrator:
             user_id=user_id,
             message_length=len(message),
             current_project=self.current_project_id,
-            step="12_complete_week3"
+            step="11_landscape_analyzer"
         )
 
         # =====================================================================
@@ -1010,7 +925,7 @@ class VedaOrchestrator:
             "cognitive_v3": self.cognitive_enabled,
             "has_metacognition": bool(metacognitive_guidance),
             "veda_version": "4.0",
-            "step": "12"
+            "step": "11"
         }
 
         if project_id:

@@ -1,0 +1,804 @@
+"""
+Veda 4.0 Orchestrator: Unified Persona + Cognitive Architecture + Multi-Project Support
+Phase 1: Emotion tracking ✅
+Phase 2: Metacognition (hidden inner monologue) ✅
+Phase 3: Associative memory ✅
+Phase 4: Curiosity-driven learning ✅
+Phase 2 Week 3: Multi-project awareness ✅ (NEW!)
+
+VEDA 4.0 NEW FEATURES:
+- Project context detection (auto + explicit)
+- SAP Knowledge Service integration
+- Landscape analyzer integration
+- Project management commands
+- Multi-project isolation
+"""
+import asyncio
+from typing import TypedDict, Literal, Annotated, Optional, List, Union, Dict, Any
+import operator
+import re
+from datetime import datetime
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+import structlog
+
+# IMPORTS
+from .openrouter_client import OpenRouterClient
+from ..persona.veda_persona import UnifiedVedaPersona, clean_code_blocks
+from ..brain.memory_manager import MemoryManager
+from ..eyes.search_tool import SearchTool
+from ..optimization.token_optimizer import TokenOptimizer
+from ..sap.diagnostic_workflow import SAPDiagnosticWorkflow
+
+# VEDA 3.0: Cognitive Architecture (Phase 2)
+from ..cognition.cognitive_graph import analyze_message_cognition
+from ..brain.memory_triggers import should_run_associations
+from ..cognition.curiosity_system import CuriositySystem
+from ..cognition.question_queue import QuestionQueue
+
+# VEDA 4.0: Phase 2 Services (Week 3)
+from ..sap.knowledge_service import SAPKnowledgeService
+from ..sap.landscape_analyzer import LandscapeAnalyzer
+from ..sap.project_service import ProjectService
+
+logger = structlog.get_logger()
+
+class ConversationState(TypedDict):
+    """State for conversation flow."""
+    messages: Annotated[list[dict], operator.add]
+    mode: Literal["personal", "work", "project"]  # NEW: Added "project" mode
+    task_type: Literal["planning", "coding", "chat", "research"]
+    persona_active: bool
+    user_emotion: Optional[str]
+    response: str
+    memory_context: list[dict]
+    search_results: Optional[str]
+    current_project: Optional[str]  # NEW: Track active project
+
+class VedaOrchestrator:
+    def __init__(self, openrouter_client: OpenRouterClient, memory_manager: MemoryManager):
+        self.client = openrouter_client
+        self.memory = memory_manager
+
+        # Initialize Components
+        self.persona = UnifiedVedaPersona()
+        self.search_tool = SearchTool()
+        self.checkpointer = MemorySaver()
+        self.optimizer = TokenOptimizer()
+        self.sap_agent = SAPDiagnosticWorkflow()
+
+        # Placeholder graph
+        self.graph = self._build_graph()
+
+        # VEDA 3.0: Cognitive features toggle
+        self.cognitive_enabled = True  # Master switch for Phase 2 metacognition
+
+        # Phase 4: Curiosity-Driven Learning
+        self.curiosity_enabled = True
+        self.curiosity = CuriositySystem(
+            uncertainty_threshold=0.45,
+            max_questions_per_conversation=2
+        )
+        self.question_queue = QuestionQueue(
+            redis_url="redis://localhost:6380",
+            cooldown_seconds=60
+        )
+
+        # =====================================================================
+        # VEDA 4.0 PHASE 2: Multi-Project Support (Week 3)
+        # =====================================================================
+        
+        # Project state tracking
+        self.current_project_id: Optional[str] = None
+        self.project_enabled = True  # Master switch for project features
+        
+        # Phase 2 services (lazy initialization)
+        self.project_service: Optional[ProjectService] = None
+        self.knowledge_service: Optional[SAPKnowledgeService] = None
+        self.landscape_analyzer: Optional[LandscapeAnalyzer] = None
+        
+        # Project detection patterns
+        self.project_patterns = [
+            r'(?:in|for|use|using)\s+(?:project\s+)?([a-z0-9_]+)',
+            r'switch\s+(?:to\s+)?(?:project\s+)?([a-z0-9_]+)',
+            r'project\s+([a-z0-9_]+)',
+            r'([a-z0-9_]+)\s+project',
+        ]
+        
+        # Project command patterns
+        self.project_commands = {
+            'list': r'(?:list|show|what)\s+projects?',
+            'switch': r'switch\s+(?:to\s+)?(?:project\s+)?([a-z0-9_]+)',
+            'current': r'(?:what|which)\s+project(?:\s+am\s+i\s+(?:in|using))?',
+            'create': r'create\s+project\s+([a-z0-9_]+)',
+            'info': r'(?:info|details)\s+(?:for|about)\s+(?:project\s+)?([a-z0-9_]+)',
+        }
+
+        logger.info(
+            "veda_4.0_orchestrator_initialized",
+            cognitive_enabled=self.cognitive_enabled,
+            project_enabled=self.project_enabled,
+            features=["emotion", "metacognition", "vision", "sap_agent", "memory", "multi_project"]
+        )
+
+    def _build_graph(self) -> StateGraph:
+        workflow = StateGraph(ConversationState)
+        workflow.add_node("classify_mode", lambda state: {"mode": "personal"})
+        workflow.add_edge(START, "classify_mode")
+        workflow.add_edge("classify_mode", END)
+        return workflow.compile(checkpointer=self.checkpointer)
+
+    # =========================================================================
+    # VEDA 4.0: PROJECT DETECTION & MANAGEMENT
+    # =========================================================================
+    
+    def _detect_project_mention(self, message: str) -> Optional[str]:
+        """
+        Detect if user mentions a project in their message.
+        
+        Examples:
+        - "check PRD system in client_acme"
+        - "switch to project acme_corp"
+        - "use acme_corp project"
+        
+        Returns:
+            Project ID if detected, None otherwise
+        """
+        message_lower = message.lower()
+        
+        # Try each pattern
+        for pattern in self.project_patterns:
+            match = re.search(pattern, message_lower)
+            if match:
+                project_id = match.group(1)
+                logger.debug(
+                    "project_detected",
+                    project_id=project_id,
+                    pattern=pattern
+                )
+                return project_id
+        
+        return None
+    
+    async def _handle_project_command(self, message: str, user_id: str) -> Optional[str]:
+        """
+        Handle explicit project management commands.
+        
+        Returns:
+            Response string if command handled, None otherwise
+        """
+        message_lower = message.lower()
+        
+        # Ensure project service is initialized
+        await self._ensure_project_services()
+        
+        # Command: List projects
+        if re.search(self.project_commands['list'], message_lower):
+            try:
+                projects = self.project_service.list_all_projects(
+                    include_archived=False,
+                    user_id=user_id
+                )
+                
+                if not projects:
+                    return "You don't have any projects yet! Want to create one? Just say 'create project <name>'"
+                
+                response = "📋 **Your Projects:**\n\n"
+                for project in projects:
+                    active_marker = "✅" if project.metadata.project_id == self.current_project_id else "  "
+                    response += f"{active_marker} **{project.metadata.name}** (`{project.metadata.project_id}`)\n"
+                    response += f"   Systems: {project.statistics.get('total_systems', 0)} | "
+                    response += f"Instances: {project.statistics.get('total_instances', 0)}\n\n"
+                
+                if self.current_project_id:
+                    response += f"\n💙 Currently using: `{self.current_project_id}`"
+                
+                return response
+            except Exception as e:
+                logger.error("list_projects_error", error=str(e))
+                return f"Oops, couldn't list projects: {str(e)}"
+        
+        # Command: Current project
+        if re.search(self.project_commands['current'], message_lower):
+            if self.current_project_id:
+                try:
+                    info = self.project_service.get_project_info(
+                        self.current_project_id,
+                        include_health=True
+                    )
+                    response = f"📍 **Current Project:** {info.metadata.name} (`{self.current_project_id}`)\n\n"
+                    response += f"Systems: {info.statistics.get('total_systems', 0)} | "
+                    response += f"Instances: {info.statistics.get('total_instances', 0)}\n"
+                    
+                    if info.health_score:
+                        response += f"Health Score: {info.health_score:.2f}/1.00\n"
+                    
+                    return response
+                except Exception as e:
+                    logger.error("current_project_error", error=str(e))
+                    return f"Currently in project `{self.current_project_id}`, but couldn't get details"
+            else:
+                return "You're not in any project right now. Use 'list projects' to see available projects!"
+        
+        # Command: Switch project
+        match = re.search(self.project_commands['switch'], message_lower)
+        if match:
+            project_id = match.group(1)
+            return await self._switch_project(project_id, user_id)
+        
+        # Command: Project info
+        match = re.search(self.project_commands['info'], message_lower)
+        if match:
+            project_id = match.group(1)
+            try:
+                info = self.project_service.get_project_info(
+                    project_id,
+                    include_health=True
+                )
+                
+                response = f"📊 **{info.metadata.name}**\n\n"
+                response += f"ID: `{info.metadata.project_id}`\n"
+                response += f"Status: {info.metadata.status.value}\n"
+                response += f"Description: {info.metadata.description or 'No description'}\n\n"
+                
+                response += "**Statistics:**\n"
+                response += f"- Systems: {info.statistics.get('total_systems', 0)}\n"
+                response += f"- Instances: {info.statistics.get('total_instances', 0)}\n"
+                response += f"- Hosts: {info.statistics.get('total_hosts', 0)}\n"
+                
+                if info.health_score:
+                    health_emoji = "✅" if info.health_score >= 0.8 else "⚠️"
+                    response += f"\n{health_emoji} Health Score: {info.health_score:.2f}/1.00\n"
+                
+                return response
+            except Exception as e:
+                logger.error("project_info_error", error=str(e), project_id=project_id)
+                return f"Couldn't get info for project `{project_id}`: {str(e)}"
+        
+        return None  # Not a project command
+    
+    async def _switch_project(self, project_id: str, user_id: str) -> str:
+        """
+        Switch to a different project.
+        
+        Args:
+            project_id: Project to switch to
+            user_id: User performing the switch
+        
+        Returns:
+            Response message
+        """
+        try:
+            # Verify project exists
+            projects = self.project_service.list_all_projects(user_id=user_id)
+            project_ids = [p.metadata.project_id for p in projects]
+            
+            if project_id not in project_ids:
+                return f"Project `{project_id}` not found. Available projects: {', '.join(project_ids)}"
+            
+            # Switch project
+            self.current_project_id = project_id
+            
+            # Reinitialize services for new project
+            self.knowledge_service = SAPKnowledgeService(
+                self.memory.project_manager,
+                project_id
+            )
+            self.landscape_analyzer = LandscapeAnalyzer(self.knowledge_service)
+            
+            logger.info(
+                "project_switched",
+                project_id=project_id,
+                user_id=user_id
+            )
+            
+            # Get project info
+            info = self.project_service.get_project_info(project_id)
+            
+            response = f"✅ Switched to **{info.metadata.name}** (`{project_id}`)\n\n"
+            response += f"Systems: {info.statistics.get('total_systems', 0)} | "
+            response += f"Instances: {info.statistics.get('total_instances', 0)}\n\n"
+            response += "You can now query systems, check health, and analyze this landscape! 💙"
+            
+            return response
+            
+        except Exception as e:
+            logger.error("switch_project_error", error=str(e), project_id=project_id)
+            return f"Couldn't switch to project `{project_id}`: {str(e)}"
+    
+    async def _ensure_project_services(self):
+        """
+        Lazy-initialize Phase 2 services if needed.
+        """
+        # Initialize project service (always available)
+        if not self.project_service:
+            self.project_service = ProjectService(self.memory.project_manager)
+            logger.debug("project_service_initialized")
+        
+        # Initialize project-specific services if project is active
+        if self.current_project_id:
+            if not self.knowledge_service:
+                self.knowledge_service = SAPKnowledgeService(
+                    self.memory.project_manager,
+                    self.current_project_id
+                )
+                logger.debug("knowledge_service_initialized", project_id=self.current_project_id)
+            
+            if not self.landscape_analyzer:
+                self.landscape_analyzer = LandscapeAnalyzer(self.knowledge_service)
+                logger.debug("landscape_analyzer_initialized", project_id=self.current_project_id)
+
+    # =========================================================================
+    # MAIN OPEN-WEBUI ENTRY POINT (Enhanced with Project Awareness)
+    # =========================================================================
+    
+    async def process_message_streaming(
+        self,
+        message: str,
+        thread_id: str,
+        full_message_payload: Optional[List[Dict[str, Any]]] = None,
+        emotional_context: Optional[Dict[str, Any]] = None,
+        user_id: str = "unknown"
+    ):
+        """
+        Veda 4.0: Processes message with Cognitive Architecture + Vision + Multi-Project Support.
+
+        NEW in 4.0:
+        - Project context detection (auto + explicit)
+        - SAP Knowledge Service integration
+        - Landscape analyzer integration
+        - Project management commands
+        """
+
+        logger.info(
+            "veda_4.0_request_started",
+            user_id=user_id,
+            message_length=len(message),
+            has_vision=bool(full_message_payload),
+            has_emotion=bool(emotional_context),
+            cognitive_enabled=self.cognitive_enabled,
+            project_enabled=self.project_enabled,
+            current_project=self.current_project_id
+        )
+
+        # =====================================================================
+        # VEDA 4.0: PROJECT COMMAND HANDLING (NEW!)
+        # =====================================================================
+        
+        if self.project_enabled:
+            # Check for explicit project commands first
+            project_command_response = await self._handle_project_command(message, user_id)
+            if project_command_response:
+                yield project_command_response
+                return
+            
+            # Auto-detect project mentions
+            detected_project = self._detect_project_mention(message)
+            if detected_project and detected_project != self.current_project_id:
+                # User mentioned a different project - offer to switch
+                logger.info(
+                    "project_auto_detected",
+                    detected=detected_project,
+                    current=self.current_project_id
+                )
+                
+                # Auto-switch if no current project
+                if not self.current_project_id:
+                    switch_result = await self._switch_project(detected_project, user_id)
+                    # Don't yield switch message, just log and continue
+                    logger.info("auto_switched_project", project=detected_project)
+
+        # 1. PARALLEL MEMORY RETRIEVAL (Uses text 'message')
+        personal_memories_task = self.memory.search(query=message, memory_type="personal", limit=3)
+        work_memories_task = self.memory.search(query=message, memory_type="work", limit=3)
+        
+        # VEDA 4.0: Add project memory if in project context
+        if self.current_project_id:
+            project_memories_task = self.memory.search(
+                query=message,
+                memory_type="work",  # Use work memory type for projects
+                limit=3,
+                project_id=self.current_project_id
+            )
+            personal_memories, work_memories, project_memories = await asyncio.gather(
+                personal_memories_task,
+                work_memories_task,
+                project_memories_task
+            )
+        else:
+            personal_memories, work_memories = await asyncio.gather(
+                personal_memories_task,
+                work_memories_task
+            )
+            project_memories = []
+
+        # 2. FORMAT & OPTIMIZE CONTEXT
+        personal_context_raw = self._format_context(personal_memories, "Personal")
+        work_context_raw = self._format_context(work_memories, "Work/SAP")
+        
+        # VEDA 4.0: Add project context
+        project_context_raw = ""
+        if self.current_project_id and project_memories:
+            project_context_raw = self._format_context(
+                project_memories,
+                f"Project ({self.current_project_id})"
+            )
+
+        # Compress
+        personal_context = self.optimizer.compress_search_results(personal_context_raw, target_ratio=0.7)
+        work_context = self.optimizer.compress_search_results(work_context_raw, target_ratio=0.7)
+        project_context = self.optimizer.compress_search_results(project_context_raw, target_ratio=0.7)
+
+        # 3. PHASE 3: ASSOCIATIVE MEMORY RETRIEVAL
+        associations_text = ""
+
+        # Check if we should trigger associations
+        trigger_decision = should_run_associations(
+            message=message,
+            conversation_history=None,
+            user_id=user_id,
+            has_direct_memories=(len(personal_memories) > 0 or len(work_memories) > 0 or len(project_memories) > 0)
+        )
+
+        if trigger_decision.should_trigger:
+            logger.info(
+                "associative_memory_triggered",
+                user_id=user_id,
+                reason=trigger_decision.reason,
+                confidence=trigger_decision.confidence
+            )
+
+            # Get associations
+            associations = []
+
+            # Personal associations
+            if personal_memories:
+                try:
+                    personal_assocs = await self.memory.get_associated_memories(
+                        query=message,
+                        direct_memories=personal_memories,
+                        memory_type="personal",
+                        max_hops=2,
+                        min_relevance=0.6
+                    )
+                    associations.extend(personal_assocs)
+                except Exception as e:
+                    logger.error("personal_associations_error", error=str(e))
+
+            # Work associations
+            if work_memories:
+                try:
+                    work_assocs = await self.memory.get_associated_memories(
+                        query=message,
+                        direct_memories=work_memories,
+                        memory_type="work",
+                        max_hops=2,
+                        min_relevance=0.6
+                    )
+                    associations.extend(work_assocs)
+                except Exception as e:
+                    logger.error("work_associations_error", error=str(e))
+            
+            # VEDA 4.0: Project associations
+            if project_memories and self.current_project_id:
+                try:
+                    project_assocs = await self.memory.get_associated_memories(
+                        query=message,
+                        direct_memories=project_memories,
+                        memory_type="work",
+                        project_id=self.current_project_id,
+                        max_hops=2,
+                        min_relevance=0.6
+                    )
+                    associations.extend(project_assocs)
+                except Exception as e:
+                    logger.error("project_associations_error", error=str(e))
+
+            # Format for prompt
+            if associations:
+                associations_text = self._format_associations(associations)
+                logger.info("associations_found", user_id=user_id, count=len(associations))
+        else:
+            logger.debug("associations_skipped", user_id=user_id, reason=trigger_decision.reason)
+
+        # ====================================================================
+        # VEDA 3.0: COGNITIVE ANALYSIS (Phase 2 - Metacognition)
+        # ====================================================================
+
+        metacognitive_guidance = ""
+        should_respond = True
+
+        if self.cognitive_enabled:
+            try:
+                logger.debug("running_cognitive_analysis", user_id=user_id)
+
+                # Determine mode (enhanced with project mode)
+                mode = self._detect_mode(message)
+
+                # Run cognitive analysis
+                cognitive_result = await analyze_message_cognition(
+                    user_message=message,
+                    user_id=user_id,
+                    emotional_context=emotional_context,
+                    conversation_history=None,
+                    mode=mode
+                )
+
+                metacognitive_guidance = cognitive_result.get("guidance", "")
+                should_respond = cognitive_result.get("should_respond", True)
+                processing_ms = cognitive_result.get("processing_time_ms", 0.0)
+
+                logger.info(
+                    "cognitive_analysis_complete",
+                    user_id=user_id,
+                    processing_ms=f"{processing_ms:.1f}",
+                    should_respond=should_respond,
+                    has_guidance=bool(metacognitive_guidance)
+                )
+
+                # If unsafe to respond, stop here
+                if not should_respond:
+                    safety_response = (
+                        "I appreciate you reaching out, but I need to respectfully "
+                        "decline this request. Is there something else I can help you with? 💙"
+                    )
+                    yield safety_response
+                    return
+
+            except Exception as e:
+                logger.error("cognitive_analysis_error", error=str(e), user_id=user_id)
+                metacognitive_guidance = ""
+                should_respond = True
+
+        # ====================================================================
+        # VEDA 4.0: INTELLIGENCE LAYER (Enhanced with Phase 2 Services)
+        # ====================================================================
+        
+        search_results = None
+
+        # Check for Complex SAP Issues
+        is_complex_sap = any(kw in message.lower() for kw in ["dump", "st22", "error", "fail", "crash", "performance"])
+
+        # Agent Delegation (Only if NO image)
+        if is_complex_sap and not full_message_payload:
+            logger.info("delegating_to_sap_agent", query=message[:50])
+            agent_diagnosis = await self.sap_agent.run(message)
+            search_results = f"AGENT DIAGNOSIS:\n{agent_diagnosis}"
+            search_results = self.optimizer.compress_search_results(search_results, target_ratio=0.6)
+
+        elif self._should_trigger_research(message):
+            logger.info("triggering_standard_research", query=message[:50])
+            category = "sap" if any(kw in message.lower() for kw in ["sap", "basis", "abap"]) else "it"
+            search_results_raw = await self.search_tool.search(query=message, category=category, max_results=5)
+            if search_results_raw:
+                search_results = self.optimizer.compress_search_results(search_results_raw, target_ratio=0.5)
+
+        # 4. BUILD UNIFIED PROMPT (WITH PROJECT CONTEXT!)
+        current_hour = datetime.now().hour
+
+        # Base system prompt
+        system_prompt = self.persona.get_unified_system_prompt(
+            personal_context=personal_context,
+            work_context=work_context,
+            user_emotion=None,
+            current_hour=current_hour,
+            emotional_state=emotional_context,
+            associations_context=associations_text
+        )
+        
+        # VEDA 4.0: Add project context to prompt
+        if self.current_project_id and project_context:
+            system_prompt += f"\n\n<project_context>\nCurrent Project: {self.current_project_id}\n{project_context}\n</project_context>"
+
+        # Inject metacognitive guidance
+        if metacognitive_guidance:
+            system_prompt += f"\n\n<metacognitive_guidance>\n{metacognitive_guidance}\n</metacognitive_guidance>"
+            logger.debug(
+                "metacognitive_guidance_injected",
+                user_id=user_id,
+                guidance_length=len(metacognitive_guidance)
+            )
+
+        # Add search results
+        if search_results:
+            system_prompt += f"\n\n<external_research>\n{search_results}\n</external_research>"
+
+        # 5. CONSTRUCT MESSAGES FOR LLM
+        user_content = full_message_payload if full_message_payload else message
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ]
+
+        # 6. ROUTE TO MODEL & VISION HANDLING
+        task_type = "chat"
+
+        if full_message_payload:
+            if any(p in message.lower() for p in ["analyze", "plan", "diagram", "architecture"]):
+                task_type = "planning"
+            elif "code" in message.lower() or "script" in message.lower():
+                task_type = "planning"
+            else:
+                task_type = "chat"
+        else:
+            if "code" in message.lower() or "script" in message.lower():
+                task_type = "coding"
+            elif any(p in message.lower() for p in ["analyze", "plan"]):
+                task_type = "planning"
+
+        logger.info(
+            "generating_response",
+            task_type=task_type,
+            has_image=bool(full_message_payload),
+            has_cognitive_guidance=bool(metacognitive_guidance),
+            has_emotion=bool(emotional_context),
+            has_project=bool(self.current_project_id)
+        )
+
+        # 7. STREAM RESPONSE WITH PHASE 4 CURIOSITY
+        response_chunks = []
+        async for chunk in await self.client.chat(
+            messages=messages,
+            task_type=task_type,
+            stream=True,
+            temperature=0.7
+        ):
+            response_chunks.append(chunk)
+
+        full_response = "".join(response_chunks)
+
+        # Phase 4: Curiosity check
+        final_response = full_response
+
+        if self.curiosity_enabled:
+            try:
+                if not self.question_queue.redis_client:
+                    await self.question_queue.initialize()
+
+                curiosity_result = await self.curiosity.analyze_response(
+                    user_query=message,
+                    veda_response=full_response,
+                    conversation_id=thread_id,
+                    conversation_length=0,
+                    user_id=user_id
+                )
+
+                if curiosity_result.should_ask and curiosity_result.question:
+                    final_response = f"{full_response}\n\n{curiosity_result.question}"
+
+                    logger.info(
+                        "curiosity_question_injected",
+                        user_id=user_id,
+                        uncertainty=f"{curiosity_result.uncertainty_result.uncertainty_score:.2f}",
+                        question_preview=curiosity_result.question[:50]
+                    )
+            except Exception as e:
+                logger.error("curiosity_error", error=str(e), user_id=user_id)
+
+        # Yield final response
+        yield final_response
+
+        # 9. BACKGROUND STORAGE (with project context)
+        if len(message) > 20:
+            asyncio.create_task(
+                self._store_memory_background(
+                    message,
+                    final_response,
+                    task_type,
+                    metacognitive_guidance,
+                    self.current_project_id  # NEW: Pass project context
+                )
+            )
+
+    def _detect_mode(self, message: str) -> str:
+        """
+        Detect if message is personal, work, or project-related.
+        Enhanced for project mode detection.
+        """
+        work_keywords = ["sap", "basis", "transaction", "system", "error", "dump", "abap", "hana"]
+        personal_keywords = ["feel", "feeling", "happy", "sad", "stressed", "tired", "excited"]
+        project_keywords = ["project", "landscape", "client", "systems", "instances"]
+
+        has_work = any(kw in message.lower() for kw in work_keywords)
+        has_personal = any(kw in message.lower() for kw in personal_keywords)
+        has_project = any(kw in message.lower() for kw in project_keywords)
+
+        # If in project context, prioritize project mode
+        if self.current_project_id and (has_project or has_work):
+            return "project"
+        elif has_work and not has_personal:
+            return "work"
+        elif has_personal and not has_work:
+            return "personal"
+        else:
+            return "personal"
+
+    async def _store_memory_background(
+        self,
+        message: str,
+        response: str,
+        task_type: str,
+        metacognitive_guidance: str = "",
+        project_id: Optional[str] = None  # NEW: Project context
+    ):
+        """
+        Store memory with optional cognitive metadata and project context.
+        """
+        has_sap = any(kw in message.lower() for kw in ["sap", "basis"])
+        has_personal = any(kw in message.lower() for kw in ["feel", "happy"])
+
+        metadata = {
+            "task": task_type,
+            "cognitive_v3": self.cognitive_enabled,
+            "has_metacognition": bool(metacognitive_guidance),
+            "veda_version": "4.0"
+        }
+        
+        # Store in project context if available
+        if project_id:
+            await self.memory.store(
+                message,
+                response,
+                "work",
+                metadata=metadata,
+                project_id=project_id
+            )
+        # Otherwise use legacy logic
+        elif has_sap or (not has_personal):
+            await self.memory.store(message, response, "work", metadata=metadata)
+        
+        if has_personal or (not has_sap and not project_id):
+            await self.memory.store(message, response, "personal", metadata=metadata)
+
+    def _format_context(self, memories: list[dict], context_type: str) -> str:
+        if not memories:
+            return ""
+        return f"{context_type} Context:\n" + "\n".join([
+            f"{i+1}. {m.get('content', '')[:150]}"
+            for i, m in enumerate(memories)
+        ])
+
+    def _format_associations(self, associations: list) -> str:
+        """Format associations for system prompt."""
+        if not associations:
+            return ""
+
+        sorted_assocs = sorted(associations, key=lambda a: a.relevance_score, reverse=True)
+        top_assocs = sorted_assocs[:2]
+
+        lines = ["<related_memories>"]
+        lines.append("(Veda naturally recalled these - mention if relevant)")
+
+        for i, assoc in enumerate(top_assocs, 1):
+            lines.append(f"\n{i}. {assoc.reasoning}")
+            lines.append(f"   Content: {assoc.content[:200]}...")
+            lines.append(f"   (Relevance: {assoc.relevance_score:.2f})")
+
+        lines.append("</related_memories>")
+        return "\n".join(lines)
+    
+    def _should_trigger_research(self, message: str) -> bool:
+        triggers = [r'sap\s*note', r'error\s*code', r'latest', r'version']
+        if any(re.search(p, message.lower()) for p in [r'^what\s+is', r'^explain']):
+            return False
+        return any(re.search(p, message.lower()) for p in triggers)
+
+    async def process_message(self, message: str, thread_id: str):
+        """Legacy non-streaming entry point (maintained for compatibility)."""
+        async for chunk in self.process_message_streaming(message, thread_id):
+            yield chunk
+
+    def enable_cognitive_features(self, enabled: bool = True):
+        """Toggle Phase 2 metacognitive features on/off."""
+        self.cognitive_enabled = enabled
+        logger.info(f"cognitive_features_{'enabled' if enabled else 'disabled'}")
+    
+    def enable_project_features(self, enabled: bool = True):
+        """
+        Toggle Phase 2 project features on/off.
+        NEW in Veda 4.0.
+        """
+        self.project_enabled = enabled
+        logger.info(f"project_features_{'enabled' if enabled else 'disabled'}")

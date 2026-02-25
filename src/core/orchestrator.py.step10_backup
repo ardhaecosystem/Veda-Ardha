@@ -1,10 +1,12 @@
 """
-Veda 4.0 Orchestrator: Complete Week 3 (Steps 9-12)
+Veda 4.0 Orchestrator: Step 10 - Knowledge Service Integration
 
-STEP 9: Project awareness and switching
-STEP 10: SAP query detection and knowledge_service integration
-STEP 11: Landscape analysis (health, risks, recommendations, capacity)
-STEP 12: Full project management (create, rename, delete)
+NEW in Step 10:
+- SAP query detection and routing
+- knowledge_service integration for system/instance queries
+- Port calculation capabilities
+- Conflict detection
+- Results formatted for LLM context
 """
 
 import asyncio
@@ -67,7 +69,7 @@ class VedaOrchestrator:
 
         # VEDA 3.0: Cognitive features
         self.cognitive_enabled = True
-
+        
         # Phase 4: Curiosity
         self.curiosity_enabled = True
         self.curiosity = CuriositySystem(
@@ -82,12 +84,12 @@ class VedaOrchestrator:
         # VEDA 4.0: Multi-Project Support
         self.current_project_id: Optional[str] = None
         self.project_enabled = True
-
+        
         # Phase 2 services (lazy initialization)
         self.project_service: Optional[ProjectService] = None
         self.knowledge_service: Optional[SAPKnowledgeService] = None
         self.landscape_analyzer: Optional[LandscapeAnalyzer] = None
-
+        
         # Project detection patterns
         self.project_patterns = [
             r'(?:in|for|use|using)\s+(?:project\s+)?([a-z0-9_]+)',
@@ -95,49 +97,39 @@ class VedaOrchestrator:
             r'project\s+([a-z0-9_]+)',
             r'([a-z0-9_]+)\s+project',
         ]
-
+        
         # Project command patterns
         self.project_commands = {
             'list': r'(?:list|show|what)\s+projects?',
             'switch': r'switch\s+(?:to\s+)?(?:project\s+)?([a-z0-9_]+)',
             'current': r'(?:what|which)\s+project(?:\s+am\s+i\s+(?:in|using))?',
-            'create': r'create\s+project\s+([a-z0-9_]+)(?:\s+(.+))?',
+            'create': r'create\s+project\s+([a-z0-9_]+)',
             'info': r'(?:info|details)\s+(?:for|about)\s+(?:project\s+)?([a-z0-9_]+)',
-            'rename': r'rename\s+project\s+([a-z0-9_]+)\s+to\s+(.+)',
-            'delete': r'delete\s+project\s+([a-z0-9_]+)(?:\s+confirm)?',
         }
-
+        
         # =====================================================================
-        # STEP 10 & 11: SAP QUERY PATTERNS
+        # STEP 10: SAP QUERY PATTERNS
         # =====================================================================
-
+        
         self.sap_query_patterns = {
             # System queries
             'get_system': r'(?:show|get|find|display)\s+(?:me\s+)?(?:the\s+)?([A-Z]{3})\s+system',
             'list_systems': r'(?:list|show|get|display)\s+(?:all\s+)?systems?',
             'production_systems': r'(?:show|list|get)\s+(?:all\s+)?(?:production|prod|prd)\s+systems?',
-
+            
             # Instance queries
             'system_instances': r'(?:show|list|get)\s+instances?\s+(?:for|in|of)\s+([A-Z]{3})',
             'list_instances': r'(?:list|show|get)\s+(?:all\s+)?instances?',
-
+            
             # Host queries
             'list_hosts': r'(?:list|show|get)\s+(?:all\s+)?hosts?',
-
+            
             # Port queries
             'calculate_ports': r'(?:calculate|show|get)\s+ports?\s+(?:for\s+)?(?:instance\s+)?(\d{2})',
             'port_conflicts': r'(?:find|check|show)\s+(?:any\s+)?port\s+conflicts?',
-
+            
             # Statistics
             'statistics': r'(?:show|get|display)\s+(?:landscape\s+)?(?:stats|statistics)',
-            
-            # STEP 11: Landscape Analysis
-            'check_health': r'(?:check|show|get)\s+(?:landscape\s+)?health',
-            'analyze_landscape': r'(?:analyze|analyse)\s+(?:the\s+)?landscape',
-            'show_risks': r'(?:show|list|get|find)\s+risks?',
-            'show_recommendations': r'(?:show|list|get|give)\s+recommendations?',
-            'analyze_capacity': r'(?:analyze|analyse|show|check)\s+capacity',
-            'generate_report': r'(?:generate|create|show)\s+(?:analysis\s+)?report',
         }
 
         logger.info(
@@ -145,9 +137,7 @@ class VedaOrchestrator:
             cognitive_enabled=self.cognitive_enabled,
             project_enabled=self.project_enabled,
             sap_queries_enabled=True,
-            landscape_analysis_enabled=True,
-            project_management_enabled=True,
-            features=["emotion", "metacognition", "vision", "sap_agent", "memory", "multi_project", "sap_queries", "landscape_analysis", "project_management"]
+            features=["emotion", "metacognition", "vision", "sap_agent", "memory", "multi_project", "sap_queries"]
         )
 
     def _build_graph(self) -> StateGraph:
@@ -160,16 +150,16 @@ class VedaOrchestrator:
     # =========================================================================
     # STEP 10: SAP QUERY DETECTION & HANDLING
     # =========================================================================
-
+    
     def _detect_sap_query(self, message: str) -> Optional[Dict[str, Any]]:
         """
         Detect if message is an SAP query.
-
+        
         Returns:
             Dict with query_type and parameters if detected, None otherwise
         """
         message_lower = message.lower()
-
+        
         for query_type, pattern in self.sap_query_patterns.items():
             match = re.search(pattern, message_lower)
             if match:
@@ -177,21 +167,21 @@ class VedaOrchestrator:
                     'query_type': query_type,
                     'pattern': pattern
                 }
-
+                
                 # Extract parameters if present
                 if match.groups():
                     result['params'] = match.groups()
-
+                
                 logger.debug(
                     "sap_query_detected",
                     query_type=query_type,
                     params=result.get('params')
                 )
-
+                
                 return result
-
+        
         return None
-
+    
     async def _handle_sap_query(
         self,
         query_info: Dict[str, Any],
@@ -199,33 +189,33 @@ class VedaOrchestrator:
     ) -> Optional[str]:
         """
         Handle SAP queries using knowledge_service.
-
+        
         Args:
             query_info: Query information from _detect_sap_query
             user_id: User making the query
-
+        
         Returns:
             Formatted results string or None if query failed
         """
         if not self.current_project_id:
             return "⚠️ No project selected. Use 'switch to <project>' to select a project first!"
-
+        
         # Ensure services are initialized
         await self._ensure_project_services()
-
+        
         if not self.knowledge_service:
             return "⚠️ Knowledge service not available"
-
+        
         query_type = query_info['query_type']
         params = query_info.get('params', ())
-
+        
         try:
             # Route to appropriate knowledge_service method
             if query_type == 'get_system':
                 sid = params[0].upper() if params else None
                 if not sid:
                     return None
-
+                
                 system = self.knowledge_service.get_system_by_sid(sid)
                 if system:
                     result = f"**{sid} System:**\n"
@@ -235,133 +225,133 @@ class VedaOrchestrator:
                     return result
                 else:
                     return f"System {sid} not found in {self.current_project_id}"
-
+            
             elif query_type == 'list_systems':
                 systems = self.knowledge_service.get_all_systems()
                 if not systems:
                     return f"No systems found in {self.current_project_id}"
-
+                
                 result = f"**Systems in {self.current_project_id}:** ({len(systems)} total)\n\n"
                 for sys in systems[:10]:  # Limit to 10
                     result += f"- **{sys.get('sid')}**: {sys.get('system_type')} ({sys.get('landscape_tier')})\n"
-
+                
                 if len(systems) > 10:
                     result += f"\n... and {len(systems) - 10} more"
-
+                
                 return result
-
+            
             elif query_type == 'production_systems':
                 systems = self.knowledge_service.get_production_systems()
                 if not systems:
                     return f"No production systems found in {self.current_project_id}"
-
+                
                 result = f"**Production Systems:** ({len(systems)} total)\n\n"
                 for sys in systems:
                     result += f"- **{sys.get('sid')}**: {sys.get('system_type')}\n"
-
+                
                 return result
-
+            
             elif query_type == 'system_instances':
                 sid = params[0].upper() if params else None
                 if not sid:
                     return None
-
+                
                 instances = self.knowledge_service.get_system_instances(sid)
                 if not instances:
                     return f"No instances found for {sid}"
-
+                
                 result = f"**Instances for {sid}:** ({len(instances)} total)\n\n"
                 for inst in instances:
                     result += f"- {inst.get('instance_type')} ({inst.get('instance_number')})"
                     if inst.get('hostname'):
                         result += f" on {inst.get('hostname')}"
                     result += "\n"
-
+                
                 return result
-
+            
             elif query_type == 'list_instances':
                 instances = self.knowledge_service.get_all_instances()
                 if not instances:
                     return f"No instances found in {self.current_project_id}"
-
+                
                 result = f"**All Instances:** ({len(instances)} total)\n\n"
                 for inst in instances[:15]:  # Limit to 15
                     result += f"- **{inst.get('sid')}** {inst.get('instance_type')} ({inst.get('instance_number')})\n"
-
+                
                 if len(instances) > 15:
                     result += f"\n... and {len(instances) - 15} more"
-
+                
                 return result
-
+            
             elif query_type == 'list_hosts':
                 hosts = self.knowledge_service.get_hosts()
                 if not hosts:
                     return f"No hosts found in {self.current_project_id}"
-
+                
                 result = f"**Hosts:** ({len(hosts)} total)\n\n"
                 for host in hosts[:10]:
                     result += f"- {host.get('hostname', 'N/A')}"
                     if host.get('ip'):
                         result += f" ({host.get('ip')})"
                     result += "\n"
-
+                
                 if len(hosts) > 10:
                     result += f"\n... and {len(hosts) - 10} more"
-
+                
                 return result
-
+            
             elif query_type == 'calculate_ports':
                 instance_number = params[0] if params else None
                 if not instance_number:
                     return None
-
+                
                 # Assume PAS for now (could be enhanced)
                 ports = self.knowledge_service.calculate_instance_ports(
                     instance_number,
                     "PAS"
                 )
-
+                
                 result = f"**Ports for Instance {instance_number} (PAS):**\n\n"
                 for port_name, port_num in ports.items():
                     result += f"- {port_name}: {port_num}\n"
-
+                
                 return result
-
+            
             elif query_type == 'port_conflicts':
                 conflicts = self.knowledge_service.find_port_conflicts()
                 if not conflicts:
                     return "✅ No port conflicts detected!"
-
+                
                 result = f"⚠️ **Port Conflicts Found:** ({len(conflicts)} total)\n\n"
                 for conflict in conflicts[:5]:  # Limit to 5
                     result += f"- Port {conflict.port}: "
                     result += f"{conflict.instance1.get('sid')}/{conflict.instance1.get('instance_number')} vs "
                     result += f"{conflict.instance2.get('sid')}/{conflict.instance2.get('instance_number')}\n"
-
+                
                 if len(conflicts) > 5:
                     result += f"\n... and {len(conflicts) - 5} more conflicts"
-
+                
                 return result
-
+            
             elif query_type == 'statistics':
                 stats = self.knowledge_service.get_statistics()
-
+                
                 result = f"**Landscape Statistics for {self.current_project_id}:**\n\n"
                 result += f"- Systems: {stats.get('total_systems', 0)}\n"
                 result += f"- Instances: {stats.get('total_instances', 0)}\n"
                 result += f"- Hosts: {stats.get('total_hosts', 0)}\n"
-
+                
                 if 'systems_by_tier' in stats:
                     result += "\n**By Tier:**\n"
                     for tier, count in stats['systems_by_tier'].items():
                         result += f"- {tier}: {count}\n"
-
+                
                 return result
-
+            
             else:
                 logger.warning("unhandled_query_type", query_type=query_type)
                 return None
-
+                
         except Exception as e:
             logger.error(
                 "sap_query_error",
@@ -371,176 +361,28 @@ class VedaOrchestrator:
             return f"❌ Error executing query: {str(e)}"
 
     # =========================================================================
-    # STEP 11: LANDSCAPE ANALYSIS HANDLING (NEW!)
-    # =========================================================================
-
-    async def _handle_landscape_query(
-        self,
-        query_info: Dict[str, Any],
-        user_id: str
-    ) -> Optional[str]:
-        """
-        Handle landscape analysis queries using landscape_analyzer.
-
-        Args:
-            query_info: Query information from _detect_sap_query
-            user_id: User making the query
-
-        Returns:
-            Formatted results string or None if query failed
-        """
-        if not self.current_project_id:
-            return "⚠️ No project selected. Use 'switch to <project>' to select a project first!"
-
-        # Ensure services are initialized
-        await self._ensure_project_services()
-
-        if not self.landscape_analyzer:
-            return "⚠️ Landscape analyzer not available"
-
-        query_type = query_info['query_type']
-
-        try:
-            # Route to appropriate landscape_analyzer method
-            if query_type == 'check_health':
-                health = self.knowledge_service.get_landscape_health()
-                
-                result = f"**Landscape Health for {self.current_project_id}:**\n\n"
-                result += f"Health Score: {health.health_score:.2f}/1.00 "
-                result += "✅ HEALTHY" if health.health_score >= 0.8 else "⚠️ NEEDS ATTENTION"
-                result += "\n\n"
-                
-                if health.port_conflicts:
-                    result += f"❌ {len(health.port_conflicts)} port conflicts\n"
-                if health.missing_dependencies:
-                    result += f"⚠️ {len(health.missing_dependencies)} dependency issues\n"
-                if health.validation_errors:
-                    result += f"⚠️ {len(health.validation_errors)} validation errors\n"
-                
-                if health.health_score >= 0.8:
-                    result += "\n✅ Landscape is healthy!"
-                
-                return result
-
-            elif query_type == 'analyze_landscape':
-                analysis = self.landscape_analyzer.analyze_landscape()
-                
-                result = f"**Landscape Analysis for {self.current_project_id}:**\n\n"
-                result += f"Health Score: {analysis.health_score:.2f}/1.00\n"
-                result += f"Risk Score: {analysis.risk_score:.2f}/1.00\n"
-                result += f"Total Risks: {len(analysis.risks)} ({analysis.critical_risks_count} critical)\n"
-                result += f"Recommendations: {len(analysis.recommendations)} ({analysis.high_priority_recommendations_count} high priority)\n\n"
-                
-                # Top 3 critical risks
-                critical_risks = [r for r in analysis.risks if r.level.value == "CRITICAL"]
-                if critical_risks:
-                    result += "**Critical Risks:**\n"
-                    for risk in critical_risks[:3]:
-                        result += f"- ❌ {risk.title}\n"
-                    result += "\n"
-                
-                # Top 3 recommendations
-                if analysis.recommendations:
-                    result += "**Top Recommendations:**\n"
-                    for rec in analysis.recommendations[:3]:
-                        result += f"- ⭐ [P{rec.priority}] {rec.title}\n"
-                
-                return result
-
-            elif query_type == 'show_risks':
-                risks = self.landscape_analyzer.identify_risks()
-                
-                if not risks:
-                    return "✅ No risks identified! Landscape looks good."
-                
-                result = f"**Identified Risks ({len(risks)} total):**\n\n"
-                
-                # Group by level
-                for level in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
-                    level_risks = [r for r in risks if r.level.value == level]
-                    if level_risks:
-                        result += f"**{level}** ({len(level_risks)}):\n"
-                        for risk in level_risks[:5]:  # Limit to 5 per level
-                            result += f"- {risk.title}: {risk.description}\n"
-                        result += "\n"
-                
-                return result
-
-            elif query_type == 'show_recommendations':
-                recommendations = self.landscape_analyzer.get_recommendations()
-                
-                if not recommendations:
-                    return "✅ No recommendations at this time. Landscape is well-configured!"
-                
-                result = f"**Recommendations ({len(recommendations)} total):**\n\n"
-                
-                # Top 5 by priority
-                for rec in recommendations[:5]:
-                    result += f"**[P{rec.priority}] {rec.title}** (Effort: {rec.effort})\n"
-                    result += f"- {rec.description}\n"
-                    result += f"- Benefit: {rec.benefit}\n\n"
-                
-                if len(recommendations) > 5:
-                    result += f"... and {len(recommendations) - 5} more recommendations"
-                
-                return result
-
-            elif query_type == 'analyze_capacity':
-                capacity_insights = self.landscape_analyzer.analyze_capacity()
-                
-                result = f"**Capacity Analysis for {self.current_project_id}:**\n\n"
-                
-                for insight in capacity_insights:
-                    status_emoji = "✅" if insight.status == "OK" else "⚠️"
-                    result += f"{status_emoji} **{insight.metric}:** "
-                    result += f"{insight.current_value:.1f}/{insight.threshold:.1f} "
-                    result += f"({insight.utilization_percent:.1f}%)\n"
-                    
-                    if insight.recommendation:
-                        result += f"  → {insight.recommendation}\n"
-                    result += "\n"
-                
-                return result
-
-            elif query_type == 'generate_report':
-                report = self.landscape_analyzer.generate_analysis_report()
-                return report
-
-            else:
-                logger.warning("unhandled_landscape_query_type", query_type=query_type)
-                return None
-
-        except Exception as e:
-            logger.error(
-                "landscape_query_error",
-                query_type=query_type,
-                error=str(e)
-            )
-            return f"❌ Error executing analysis: {str(e)}"
-
-    # =========================================================================
     # PROJECT DETECTION & MANAGEMENT (From Step 9)
     # =========================================================================
-
+    
     def _detect_project_mention(self, message: str) -> Optional[str]:
         """Detect if user mentions a project in their message."""
         message_lower = message.lower()
-
+        
         for pattern in self.project_patterns:
             match = re.search(pattern, message_lower)
             if match:
                 project_id = match.group(1)
                 logger.debug("project_detected", project_id=project_id, pattern=pattern)
                 return project_id
-
+        
         return None
-
+    
     async def _handle_project_command(self, message: str, user_id: str) -> Optional[str]:
         """Handle explicit project management commands."""
         message_lower = message.lower()
-
+        
         await self._ensure_project_services()
-
+        
         # Command: List projects
         if re.search(self.project_commands['list'], message_lower):
             try:
@@ -548,25 +390,25 @@ class VedaOrchestrator:
                     include_archived=False,
                     user_id=user_id
                 )
-
+                
                 if not projects:
                     return "You don't have any projects yet! Want to create one? Just say 'create project <name>'"
-
+                
                 response = "📋 **Your Projects:**\n\n"
                 for project in projects:
                     active_marker = "✅" if project.metadata.project_id == self.current_project_id else "  "
                     response += f"{active_marker} **{project.metadata.name}** (`{project.metadata.project_id}`)\n"
                     response += f"   Systems: {project.statistics.get('total_systems', 0)} | "
                     response += f"Instances: {project.statistics.get('total_instances', 0)}\n\n"
-
+                
                 if self.current_project_id:
                     response += f"\n💙 Currently using: `{self.current_project_id}`"
-
+                
                 return response
             except Exception as e:
                 logger.error("list_projects_error", error=str(e))
                 return f"Oops, couldn't list projects: {str(e)}"
-
+        
         # Command: Current project
         if re.search(self.project_commands['current'], message_lower):
             if self.current_project_id:
@@ -578,20 +420,20 @@ class VedaOrchestrator:
                     response = f"📍 **Current Project:** {info.metadata.name} (`{self.current_project_id}`)\n\n"
                     response += f"Systems: {info.statistics.get('total_systems', 0)} | "
                     response += f"Instances: {info.statistics.get('total_instances', 0)}\n"
-
+                    
                     return response
                 except Exception as e:
                     logger.error("current_project_error", error=str(e))
                     return f"Currently in project `{self.current_project_id}`, but couldn't get details"
             else:
                 return "You're not in any project right now. Use 'list projects' to see available projects!"
-
+        
         # Command: Switch project
         match = re.search(self.project_commands['switch'], message_lower)
         if match:
             project_id = match.group(1)
             return await self._switch_project(project_id, user_id)
-
+        
         # Command: Project info
         match = re.search(self.project_commands['info'], message_lower)
         if match:
@@ -601,141 +443,63 @@ class VedaOrchestrator:
                     project_id,
                     include_health=False
                 )
-
+                
                 response = f"📊 **{info.metadata.name}**\n\n"
                 response += f"ID: `{info.metadata.project_id}`\n"
                 response += f"Status: {info.metadata.status.value}\n"
                 response += f"Description: {info.metadata.description or 'No description'}\n\n"
-
+                
                 response += "**Statistics:**\n"
                 response += f"- Systems: {info.statistics.get('total_systems', 0)}\n"
                 response += f"- Instances: {info.statistics.get('total_instances', 0)}\n"
                 response += f"- Hosts: {info.statistics.get('total_hosts', 0)}\n"
-
+                
                 return response
             except Exception as e:
                 logger.error("project_info_error", error=str(e), project_id=project_id)
                 return f"Couldn't get info for project `{project_id}`: {str(e)}"
-
-        # =====================================================================
-        # STEP 12: PROJECT MANAGEMENT COMMANDS
-        # =====================================================================
-
-        # Command: Create project
-        match = re.search(self.project_commands['create'], message_lower)
-        if match:
-            project_id = match.group(1)
-            description = match.group(2) if len(match.groups()) > 1 and match.group(2) else None
-            
-            try:
-                # Create project
-                context = self.memory.project_manager.create_project(
-                    project_id=project_id,
-                    metadata={'description': description} if description else None
-                )
-                
-                # Switch to new project
-                await self._switch_project(project_id, user_id)
-                
-                response = f"✅ Created project **{project_id}**!\n\n"
-                if description:
-                    response += f"Description: {description}\n\n"
-                response += "You're now working in this project. Add systems with SAP tools! 💙"
-                
-                logger.info("project_created", project_id=project_id, user_id=user_id)
-                return response
-            except ValueError as e:
-                return f"❌ Couldn't create project: {str(e)}"
-            except Exception as e:
-                logger.error("create_project_error", error=str(e), project_id=project_id)
-                return f"❌ Error creating project: {str(e)}"
-
-        # Command: Rename project
-        match = re.search(self.project_commands['rename'], message_lower)
-        if match:
-            project_id = match.group(1)
-            new_name = match.group(2)
-            
-            try:
-                # Update metadata
-                self.project_service.update_metadata(
-                    project_id=project_id,
-                    name=new_name
-                )
-                
-                logger.info("project_renamed", project_id=project_id, new_name=new_name, user_id=user_id)
-                return f"✅ Renamed project `{project_id}` to **{new_name}**!"
-            except Exception as e:
-                logger.error("rename_project_error", error=str(e), project_id=project_id)
-                return f"❌ Error renaming project: {str(e)}"
-
-        # Command: Delete project
-        match = re.search(self.project_commands['delete'], message_lower)
-        if match:
-            project_id = match.group(1)
-            has_confirm = 'confirm' in message_lower
-            
-            if not has_confirm:
-                return f"⚠️ **Warning:** Deleting `{project_id}` will permanently remove all data!\n\nTo confirm, say: **delete project {project_id} confirm**"
-            
-            try:
-                # Unmount if current
-                if self.current_project_id == project_id:
-                    self.current_project_id = None
-                    self.knowledge_service = None
-                    self.landscape_analyzer = None
-                    logger.debug("unmounted_project_before_delete", project_id=project_id)
-                
-                # Delete
-                self.memory.project_manager.delete_project(project_id, confirm=True)
-                
-                logger.warning("project_deleted", project_id=project_id, user_id=user_id)
-                return f"✅ Deleted project `{project_id}`. All data has been removed."
-            except Exception as e:
-                logger.error("delete_project_error", error=str(e), project_id=project_id)
-                return f"❌ Error deleting project: {str(e)}"
-
+        
         return None
-
+    
     async def _switch_project(self, project_id: str, user_id: str) -> str:
         """Switch to a different project."""
         try:
             projects = self.project_service.list_all_projects(user_id=user_id)
             project_ids = [p.metadata.project_id for p in projects]
-
+            
             if project_id not in project_ids:
                 return f"Project `{project_id}` not found. Available projects: {', '.join(project_ids)}"
-
+            
             self.current_project_id = project_id
-
+            
             # Reinitialize services for new project
             self.knowledge_service = SAPKnowledgeService(
                 self.memory.project_manager,
                 project_id
             )
             self.landscape_analyzer = LandscapeAnalyzer(self.knowledge_service)
-
+            
             logger.info("project_switched", project_id=project_id, user_id=user_id)
-
+            
             info = self.project_service.get_project_info(project_id)
-
+            
             response = f"✅ Switched to **{info.metadata.name}** (`{project_id}`)\n\n"
             response += f"Systems: {info.statistics.get('total_systems', 0)} | "
             response += f"Instances: {info.statistics.get('total_instances', 0)}\n\n"
             response += "You can now query systems, check health, and analyze this landscape! 💙"
-
+            
             return response
-
+            
         except Exception as e:
             logger.error("switch_project_error", error=str(e), project_id=project_id)
             return f"Couldn't switch to project `{project_id}`: {str(e)}"
-
+    
     async def _ensure_project_services(self):
         """Lazy-initialize Phase 2 services if needed."""
         if not self.project_service:
             self.project_service = ProjectService(self.memory.project_manager)
             logger.debug("project_service_initialized")
-
+        
         if self.current_project_id:
             if not self.knowledge_service:
                 self.knowledge_service = SAPKnowledgeService(
@@ -743,15 +507,15 @@ class VedaOrchestrator:
                     self.current_project_id
                 )
                 logger.debug("knowledge_service_initialized", project_id=self.current_project_id)
-
+            
             if not self.landscape_analyzer:
                 self.landscape_analyzer = LandscapeAnalyzer(self.knowledge_service)
                 logger.debug("landscape_analyzer_initialized", project_id=self.current_project_id)
 
     # =========================================================================
-    # MAIN ENTRY POINT (Enhanced with SAP Queries & Landscape Analysis)
+    # MAIN ENTRY POINT (Enhanced with SAP Queries - Step 10)
     # =========================================================================
-
+    
     async def process_message_streaming(
         self,
         message: str,
@@ -761,13 +525,7 @@ class VedaOrchestrator:
         user_id: str = "unknown"
     ):
         """
-        Veda 4.0 Week 3 Complete: Full multi-project SAP landscape management.
-        
-        Steps 9-12:
-        - Project awareness and switching
-        - SAP queries via knowledge_service
-        - Landscape analysis via landscape_analyzer
-        - Full project management (create/rename/delete)
+        Veda 4.0 Step 10: With SAP query handling via knowledge_service.
         """
 
         logger.info(
@@ -775,69 +533,55 @@ class VedaOrchestrator:
             user_id=user_id,
             message_length=len(message),
             current_project=self.current_project_id,
-            step="12_complete_week3"
+            step="10_knowledge_service"
         )
 
         # =====================================================================
         # PROJECT COMMAND HANDLING
         # =====================================================================
-
+        
         if self.project_enabled:
             project_command_response = await self._handle_project_command(message, user_id)
             if project_command_response:
                 yield project_command_response
                 return
-
+            
             detected_project = self._detect_project_mention(message)
             if detected_project and detected_project != self.current_project_id:
                 if not self.current_project_id:
                     switch_result = await self._switch_project(detected_project, user_id)
                     logger.info("auto_switched_project", project=detected_project)
-
+        
         # =====================================================================
-        # STEP 10 & 11: SAP QUERY & LANDSCAPE ANALYSIS HANDLING
+        # STEP 10: SAP QUERY HANDLING (NEW!)
         # =====================================================================
-
+        
         sap_query_results = None
-
+        
         if self.project_enabled and self.current_project_id:
             sap_query = self._detect_sap_query(message)
             if sap_query:
-                query_type = sap_query['query_type']
+                logger.info(
+                    "sap_query_detected_step10",
+                    query_type=sap_query['query_type'],
+                    project=self.current_project_id
+                )
                 
-                # Determine if it's a landscape analysis query (Step 11)
-                landscape_queries = ['check_health', 'analyze_landscape', 'show_risks', 
-                                   'show_recommendations', 'analyze_capacity', 'generate_report']
+                sap_query_results = await self._handle_sap_query(sap_query, user_id)
                 
-                if query_type in landscape_queries:
-                    logger.info(
-                        "landscape_query_detected_step11",
-                        query_type=query_type,
-                        project=self.current_project_id
-                    )
-                    sap_query_results = await self._handle_landscape_query(sap_query, user_id)
-                else:
-                    logger.info(
-                        "sap_query_detected_step10",
-                        query_type=query_type,
-                        project=self.current_project_id
-                    )
-                    sap_query_results = await self._handle_sap_query(sap_query, user_id)
-
                 if sap_query_results:
                     logger.info(
-                        "query_results_obtained",
-                        result_length=len(sap_query_results),
-                        query_type=query_type
+                        "sap_query_results_obtained",
+                        result_length=len(sap_query_results)
                     )
 
         # [REST OF THE ORCHESTRATOR CODE CONTINUES AS BEFORE...]
         # Memory retrieval, cognitive analysis, etc.
-
+        
         # 1. PARALLEL MEMORY RETRIEVAL
         personal_memories_task = self.memory.search(query=message, memory_type="personal", limit=3)
         work_memories_task = self.memory.search(query=message, memory_type="work", limit=3)
-
+        
         if self.current_project_id:
             project_memories_task = self.memory.search(
                 query=message,
@@ -859,7 +603,7 @@ class VedaOrchestrator:
         # 2. FORMAT & OPTIMIZE CONTEXT
         personal_context_raw = self._format_context(personal_memories, "Personal")
         work_context_raw = self._format_context(work_memories, "Work/SAP")
-
+        
         project_context_raw = ""
         if self.current_project_id and project_memories:
             project_context_raw = self._format_context(
@@ -903,14 +647,14 @@ class VedaOrchestrator:
             emotional_state=emotional_context,
             associations_context=associations_text
         )
-
+        
         if self.current_project_id and project_context:
             system_prompt += f"\n\n<project_context>\nCurrent Project: {self.current_project_id}\n{project_context}\n</project_context>"
 
-        # STEP 10 & 11: Add query results to prompt
+        # STEP 10: Add SAP query results to prompt
         if sap_query_results:
             system_prompt += f"\n\n<sap_query_results>\n{sap_query_results}\n</sap_query_results>"
-            logger.debug("query_results_injected", length=len(sap_query_results))
+            logger.debug("sap_query_results_injected", length=len(sap_query_results))
 
         if metacognitive_guidance:
             system_prompt += f"\n\n<metacognitive_guidance>\n{metacognitive_guidance}\n</metacognitive_guidance>"
@@ -942,7 +686,7 @@ class VedaOrchestrator:
         logger.info(
             "generating_response",
             task_type=task_type,
-            has_query_results=bool(sap_query_results),
+            has_sap_query_results=bool(sap_query_results),
             has_project=bool(self.current_project_id)
         )
 
@@ -1010,9 +754,9 @@ class VedaOrchestrator:
             "cognitive_v3": self.cognitive_enabled,
             "has_metacognition": bool(metacognitive_guidance),
             "veda_version": "4.0",
-            "step": "12"
+            "step": "10"
         }
-
+        
         if project_id:
             await self.memory.store(
                 message,
@@ -1022,7 +766,7 @@ class VedaOrchestrator:
             )
         elif has_sap or (not has_personal):
             await self.memory.store(message, response, "work", metadata=metadata)
-
+        
         if has_personal or (not has_sap and not project_id):
             await self.memory.store(message, response, "personal", metadata=metadata)
 
@@ -1047,7 +791,7 @@ class VedaOrchestrator:
             lines.append(f"   (Relevance: {assoc.relevance_score:.2f})")
         lines.append("</related_memories>")
         return "\n".join(lines)
-
+    
     def _should_trigger_research(self, message: str) -> bool:
         triggers = [r'sap\s*note', r'error\s*code', r'latest', r'version']
         if any(re.search(p, message.lower()) for p in [r'^what\s+is', r'^explain']):
@@ -1063,7 +807,7 @@ class VedaOrchestrator:
         """Toggle cognitive features."""
         self.cognitive_enabled = enabled
         logger.info(f"cognitive_features_{'enabled' if enabled else 'disabled'}")
-
+    
     def enable_project_features(self, enabled: bool = True):
         """Toggle project features."""
         self.project_enabled = enabled

@@ -2,12 +2,6 @@
 Veda Brain - Memory System using Graphiti + FalkorDB.
 LIGHTWEIGHT VERSION: Compression moved to TokenOptimizer.
 MAINTENANCE UPDATE: Added consolidate_memories for Dream State.
-VEDA 4.0 UPDATE: Added project_id support for multi-project isolation.
-
-BACKWARD COMPATIBILITY:
-- If project_id is None (default), uses existing personal/work memory (Veda 3.0)
-- If project_id is provided, uses project-scoped graph (Veda 4.0)
-- All existing code continues to work without changes
 """
 
 import asyncio
@@ -22,10 +16,6 @@ from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 import structlog
 from .associative_memory import get_associations, Association
-
-# VEDA 4.0: Import project context manager
-# Directory structure: src/brain/memory_manager.py -> src/projects/context_manager.py
-from ..projects.context_manager import ProjectContextManager
 
 logger = structlog.get_logger()
 
@@ -43,7 +33,6 @@ class MemoryManager:
     - Separate episodic memory for Personal and Work modes.
     - Bi-temporal tracking.
     - Selective storage (Importance Scoring).
-    - VEDA 4.0: Multi-project isolation support.
     """
 
     def __init__(
@@ -65,14 +54,7 @@ class MemoryManager:
             database="work_memory"
         )
 
-        # VEDA 4.0: Initialize project context manager
-        self.project_manager = ProjectContextManager(
-            falkordb_host=falkordb_host,
-            falkordb_port=falkordb_port,
-            falkordb_password=falkordb_password
-        )
-
-        logger.info("memory_manager_initialized", veda_version="4.0", multi_project_enabled=True)
+        logger.info("memory_manager_initialized")
 
     def _create_graphiti(
         self,
@@ -125,58 +107,7 @@ class MemoryManager:
         await self.work_graphiti.build_indices_and_constraints()
         logger.info("memory_indices_built")
 
-    def _get_graphiti(
-        self,
-        memory_type: Literal["personal", "work"],
-        project_id: Optional[str] = None
-    ) -> Graphiti:
-        """
-        Get Graphiti instance for specified memory type.
-        
-        VEDA 4.0 CHANGE: Added project_id parameter.
-        
-        Args:
-            memory_type: "personal" or "work" (Veda 3.0 compatibility)
-            project_id: Optional project ID for multi-project isolation (Veda 4.0)
-            
-        Returns:
-            Graphiti instance
-            
-        Behavior:
-            - If project_id is None: Returns personal_graphiti or work_graphiti (Veda 3.0)
-            - If project_id provided: Returns project-specific Graphiti (Veda 4.0)
-        """
-        # VEDA 4.0: Project-scoped memory
-        if project_id is not None:
-            # Mount the project and get its Graphiti instance
-            context = self.project_manager.mount(project_id)
-            
-            # Create a Graphiti instance for this project's graph
-            # We need to create a new Graphiti with the project's graph driver
-            from graphiti_core.driver.falkordb_driver import FalkorDriver
-            
-            # Get the graph from context
-            project_graph = context.graph
-            
-            # Create a new FalkorDriver wrapper for the project graph
-            # Note: This is a lightweight wrapper, not a new connection
-            driver = FalkorDriver(
-                host=self.project_manager.db._client.host,
-                port=self.project_manager.db._client.port,
-                password=self.project_manager.db._client.password,
-                database=f"project_{project_id}"
-            )
-            
-            # Return a Graphiti instance for this project
-            # Reuse LLM/embedder config from personal_graphiti
-            return Graphiti(
-                graph_driver=driver,
-                llm_client=self.personal_graphiti.llm_client,
-                embedder=self.personal_graphiti.embedder,
-                cross_encoder=self.personal_graphiti.cross_encoder,
-            )
-        
-        # VEDA 3.0: Personal/Work memory (backward compatible)
+    def _get_graphiti(self, memory_type: Literal["personal", "work"]) -> Graphiti:
         return self.personal_graphiti if memory_type == "personal" else self.work_graphiti
 
     async def store(
@@ -185,73 +116,31 @@ class MemoryManager:
         assistant_response: str,
         memory_type: Literal["personal", "work"],
         metadata: Optional[dict] = None,
-        project_id: Optional[str] = None,  # VEDA 4.0: New parameter
     ):
-        """
-        Store conversation in appropriate memory space based on importance.
-        
-        VEDA 4.0 CHANGE: Added project_id parameter.
-        
-        Args:
-            user_message: User's message
-            assistant_response: Veda's response
-            memory_type: "personal" or "work"
-            metadata: Optional metadata dict
-            project_id: Optional project ID for multi-project isolation (Veda 4.0)
-            
-        Behavior:
-            - If project_id is None: Uses personal/work memory (Veda 3.0)
-            - If project_id provided: Uses project-specific memory (Veda 4.0)
-        """
+        """Store conversation in appropriate memory space based on importance."""
         importance = await self._calculate_importance(user_message, assistant_response, memory_type)
 
         if importance < 0.3:
             return
 
-        graphiti = self._get_graphiti(memory_type, project_id=project_id)
+        graphiti = self._get_graphiti(memory_type)
         episode_content = f"""User: {user_message}\nAssistant: {assistant_response}"""
-
-        # VEDA 4.0: Add project context to metadata
-        source_desc = f"Conversation in {memory_type} mode"
-        if project_id:
-            source_desc += f" (Project: {project_id})"
 
         await graphiti.add_episode(
             name=f"{memory_type}_conversation_{datetime.now().isoformat()}",
             episode_body=episode_content,
             reference_time=datetime.now(),
-            source_description=source_desc,
+            source_description=f"Conversation in {memory_type} mode",
         )
-        
-        if project_id:
-            logger.debug("memory_stored", memory_type=memory_type, project_id=project_id)
 
     async def search(
         self,
         query: str,
         memory_type: Literal["personal", "work"],
         limit: int = 5,
-        project_id: Optional[str] = None,  # VEDA 4.0: New parameter
     ) -> list[dict]:
-        """
-        Search memories using semantic search.
-        
-        VEDA 4.0 CHANGE: Added project_id parameter.
-        
-        Args:
-            query: Search query
-            memory_type: "personal" or "work"
-            limit: Maximum results to return
-            project_id: Optional project ID for multi-project isolation (Veda 4.0)
-            
-        Returns:
-            List of memory dicts
-            
-        Behavior:
-            - If project_id is None: Searches personal/work memory (Veda 3.0)
-            - If project_id provided: Searches project-specific memory (Veda 4.0)
-        """
-        graphiti = self._get_graphiti(memory_type, project_id=project_id)
+        """Search memories using semantic search."""
+        graphiti = self._get_graphiti(memory_type)
         results = await graphiti.search(query=query, num_results=limit)
 
         memories = []
@@ -260,10 +149,6 @@ class MemoryManager:
                 "content": result.fact if hasattr(result, 'fact') else str(result),
                 "timestamp": result.created_at if hasattr(result, 'created_at') else datetime.now(),
             })
-        
-        if project_id:
-            logger.debug("memory_searched", memory_type=memory_type, project_id=project_id, results=len(memories))
-        
         return memories
 
     # --- NEW METHOD ADDED FOR DREAM STATE ---
@@ -291,15 +176,12 @@ class MemoryManager:
         direct_memories: list[dict],
         memory_type: Literal["personal", "work"],
         max_hops: int = 2,
-        min_relevance: float = 0.6,
-        project_id: Optional[str] = None,  # VEDA 4.0: New parameter
+        min_relevance: float = 0.6
     ) -> list:
         """
         Find semantically associated memories using spreading activation.
 
         Phase 3: Associative Memory - finds related memories through graph traversal.
-        
-        VEDA 4.0 CHANGE: Added project_id parameter.
 
         Args:
             query: User's current query
@@ -307,19 +189,18 @@ class MemoryManager:
             memory_type: "personal" or "work"
             max_hops: Graph traversal depth (1-3, default 2)
             min_relevance: Minimum relevance score (0.0-1.0, default 0.6)
-            project_id: Optional project ID for multi-project isolation (Veda 4.0)
 
         Returns:
             List of Association objects with content, relevance, reasoning
         """
 
         if not direct_memories:
-            logger.debug("no_direct_memories_for_association", memory_type=memory_type, project_id=project_id)
+            logger.debug("no_direct_memories_for_association", memory_type=memory_type)
             return []
 
         try:
             # Get the appropriate graphiti instance
-            graphiti = self._get_graphiti(memory_type, project_id=project_id)
+            graphiti = self._get_graphiti(memory_type)
 
             # Use associative retrieval from File 1
             associations = await get_associations(
@@ -334,7 +215,6 @@ class MemoryManager:
             logger.info(
                 "associative_retrieval_complete",
                 memory_type=memory_type,
-                project_id=project_id,
                 associations_found=len(associations)
             )
 
@@ -344,7 +224,6 @@ class MemoryManager:
             logger.error(
                 "associative_retrieval_error",
                 memory_type=memory_type,
-                project_id=project_id,
                 error=str(e)
             )
             return []
@@ -359,43 +238,33 @@ class MemoryManager:
         clarification_question: str,
         user_answer: str,
         memory_type: Literal["personal", "work"],
-        uncertainty_score: float = 0.0,
-        project_id: Optional[str] = None,  # VEDA 4.0: New parameter
+        uncertainty_score: float = 0.0
     ):
-        """
-        Store a clarification interaction for learning.
+        """Store a clarification interaction for learning."""
         
-        VEDA 4.0 CHANGE: Added project_id parameter.
-        """
-
         clarification_entry = f"""
         [CLARIFICATION INTERACTION]
         Original Query: {original_query}
         Veda Asked: {clarification_question}
         User Clarified: {user_answer}
         Uncertainty Score: {uncertainty_score:.2f}
-
+        
         This interaction taught me to ask for specifics when users say things like
         "{original_query[:50]}..." without providing necessary context.
         """
-
-        graphiti = self._get_graphiti(memory_type, project_id=project_id)
-
-        source_desc = f"Phase 4 clarification learning in {memory_type} mode"
-        if project_id:
-            source_desc += f" (Project: {project_id})"
-
+        
+        graphiti = self._get_graphiti(memory_type)
+        
         await graphiti.add_episode(
             name=f"clarification_{memory_type}_{datetime.now().isoformat()}",
             episode_body=clarification_entry,
             reference_time=datetime.now(),
-            source_description=source_desc,
+            source_description=f"Phase 4 clarification learning in {memory_type} mode",
         )
-
+        
         logger.info(
             "clarification_stored",
             memory_type=memory_type,
-            project_id=project_id,
             uncertainty=f"{uncertainty_score:.2f}",
             query_preview=original_query[:50]
         )
@@ -404,19 +273,14 @@ class MemoryManager:
         self,
         query: str,
         memory_type: Literal["personal", "work"],
-        limit: int = 3,
-        project_id: Optional[str] = None,  # VEDA 4.0: New parameter
+        limit: int = 3
     ) -> list[dict]:
-        """
-        Retrieve past clarification patterns.
+        """Retrieve past clarification patterns."""
         
-        VEDA 4.0 CHANGE: Added project_id parameter.
-        """
-
-        graphiti = self._get_graphiti(memory_type, project_id=project_id)
+        graphiti = self._get_graphiti(memory_type)
         search_query = f"clarification interaction {query}"
         results = await graphiti.search(query=search_query, num_results=limit)
-
+        
         clarifications = []
         for result in results:
             content = result.fact if hasattr(result, 'fact') else str(result)
@@ -425,7 +289,7 @@ class MemoryManager:
                     "content": content,
                     "timestamp": result.created_at if hasattr(result, 'created_at') else datetime.now(),
                 })
-
+        
         return clarifications
 
     async def store_knowledge_gap(
@@ -433,50 +297,36 @@ class MemoryManager:
         topic: str,
         gap_description: str,
         memory_type: Literal["personal", "work"],
-        priority: float = 0.5,
-        project_id: Optional[str] = None,  # VEDA 4.0: New parameter
+        priority: float = 0.5
     ):
-        """
-        Store identified knowledge gap.
+        """Store identified knowledge gap."""
         
-        VEDA 4.0 CHANGE: Added project_id parameter.
-        """
-
         gap_entry = f"""
         [KNOWLEDGE GAP]
         Topic: {topic}
         Gap: {gap_description}
         Priority: {priority:.2f}
         """
-
-        graphiti = self._get_graphiti(memory_type, project_id=project_id)
-
-        source_desc = f"Phase 4 knowledge gap in {memory_type} mode"
-        if project_id:
-            source_desc += f" (Project: {project_id})"
-
+        
+        graphiti = self._get_graphiti(memory_type)
+        
         await graphiti.add_episode(
             name=f"knowledge_gap_{memory_type}_{datetime.now().isoformat()}",
             episode_body=gap_entry,
             reference_time=datetime.now(),
-            source_description=source_desc,
+            source_description=f"Phase 4 knowledge gap in {memory_type} mode",
         )
 
     async def get_knowledge_gaps(
         self,
         memory_type: Literal["personal", "work"],
-        limit: int = 5,
-        project_id: Optional[str] = None,  # VEDA 4.0: New parameter
+        limit: int = 5
     ) -> list[dict]:
-        """
-        Retrieve stored knowledge gaps.
+        """Retrieve stored knowledge gaps."""
         
-        VEDA 4.0 CHANGE: Added project_id parameter.
-        """
-
-        graphiti = self._get_graphiti(memory_type, project_id=project_id)
+        graphiti = self._get_graphiti(memory_type)
         results = await graphiti.search(query="knowledge gap priority", num_results=limit)
-
+        
         gaps = []
         for result in results:
             content = result.fact if hasattr(result, 'fact') else str(result)
@@ -485,7 +335,7 @@ class MemoryManager:
                     "content": content,
                     "timestamp": result.created_at if hasattr(result, 'created_at') else datetime.now(),
                 })
-
+        
         return gaps
 
     async def close(self):
